@@ -4,8 +4,13 @@ import os
 import re
 import yt_dlp
 
-# Proxy configuration to route traffic through residential nodes
+# Proxy configuration for Facebook's login walls
 PROXY_URL = "http://spz3hzzvu2:tVmz3i_0htJc9WY6cl@gate.decodo.com:10001"
+
+# The URL of your Render token provider service. 
+# If running locally or on the same container, use "http://127.0.0.1:4416"
+# If deployed as a separate Render Web Service, use its internal/external URL.
+POT_PROVIDER_URL = "http://127.0.0.1:4416"
 
 
 class UnsupportedURLError(Exception):
@@ -31,8 +36,18 @@ def fetch_info(url: str) -> dict:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
-        "proxy": PROXY_URL,  # Injected residential proxy
     }
+
+    # Apply specialized routing based on the target platform
+    if "facebook.com" in url or "fb.watch" in url:
+        ydl_opts["proxy"] = PROXY_URL
+    elif "youtube.com" in url or "youtu.be" in url:
+        ydl_opts["extractor_args"] = {
+            "youtubepot-bgutilhttp": {
+                "base_url": [POT_PROVIDER_URL]
+            }
+        }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -79,7 +94,6 @@ def download_media(
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "proxy": PROXY_URL,  # Injected residential proxy
     }
 
     if audio_only:
@@ -94,6 +108,16 @@ def download_media(
         ydl_opts["format"] = (
             f"{format_id}/bestvideo+bestaudio/best" if format_id else "bestvideo+bestaudio/best"
         )
+
+    # Apply specialized routing based on the target platform
+    if "facebook.com" in url or "fb.watch" in url:
+        ydl_opts["proxy"] = PROXY_URL
+    elif "youtube.com" in url or "youtu.be" in url:
+        ydl_opts["extractor_args"] = {
+            "youtubepot-bgutilhttp": {
+                "base_url": [POT_PROVIDER_URL]
+            }
+        }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
