@@ -4,6 +4,9 @@ import os
 import re
 import yt_dlp
 
+# Proxy configuration to route traffic through residential nodes
+PROXY_URL = "http://spz3hzzvu2:tVmz3i_0htJc9WY6cl@gate.decodo.com:10001"
+
 
 class UnsupportedURLError(Exception):
     """Raised when yt-dlp can't extract or download a given URL."""
@@ -28,6 +31,7 @@ def fetch_info(url: str) -> dict:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "proxy": PROXY_URL,  # Injected residential proxy
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -75,6 +79,7 @@ def download_media(
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "proxy": PROXY_URL,  # Injected residential proxy
     }
 
     if audio_only:
