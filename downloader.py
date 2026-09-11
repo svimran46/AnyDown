@@ -1,79 +1,123 @@
-"""Thin wrapper around yt-dlp: metadata extraction + actual downloading."""
+"""yt-dlp based media extraction and downloading for AnyDown."""
 
 import os
 import re
+from urllib.parse import urlparse
+
 import yt_dlp
 
-# Proxy configuration for Facebook's login walls
-PROXY_URL = "http://spz3hzzvu2:tVmz3i_0htJc9WY6cl@gate.decodo.com:10001"
 
-# The URL of your Render token provider service. 
-# If running locally or on the same container, use "http://127.0.0.1:4416"
-# If deployed as a separate Render Web Service, use its internal/external URL.
-POT_PROVIDER_URL = "http://127.0.0.1:4416"
+PROXY_URL = os.getenv("DOWNLOADER_PROXY_URL", "").strip() or None
+POT_PROVIDER_URL = os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip() or None
 
 
 class UnsupportedURLError(Exception):
-    """Raised when yt-dlp can't extract or download a given URL."""
+    """Raised when yt-dlp cannot extract or download a URL."""
 
 
 def _sanitize_filename(name: str) -> str:
-    name = re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+    name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "_", name).strip().strip(".")
     return name[:150] if name else "download"
 
 
 def _find_downloaded_file(output_dir: str, job_id: str) -> str | None:
+    matches = []
     for fname in os.listdir(output_dir):
-        if fname.startswith(job_id + "."):
-            return os.path.join(output_dir, fname)
-    return None
+        if fname.startswith(job_id + ".") and not fname.endswith(('.part', '.ytdl')):
+            path = os.path.join(output_dir, fname)
+            if os.path.isfile(path):
+                matches.append(path)
+    if not matches:
+        return None
+    return max(matches, key=os.path.getmtime)
+
+
+def _base_options() -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 20,
+        "file_access_retries": 3,
+        "continuedl": True,
+    }
+    if PROXY_URL:
+        # A proxy is useful for deployments that need it; it is never hard-coded.
+        opts["proxy"] = PROXY_URL
+    if POT_PROVIDER_URL:
+        opts["extractor_args"] = {
+            "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}
+        }
+    return opts
+
+
+def _format_info(f: dict) -> dict | None:
+    has_video = f.get("vcodec") not in (None, "none")
+    has_audio = f.get("acodec") not in (None, "none")
+    if not has_video and not has_audio:
+        return None
+
+    height = f.get("height")
+    resolution = f.get("resolution") or (f"{height}p" if height else None)
+    return {
+        "format_id": str(f.get("format_id")) if f.get("format_id") is not None else None,
+        "ext": f.get("ext"),
+        "resolution": resolution,
+        "height": height,
+        "width": f.get("width"),
+        "fps": f.get("fps"),
+        "has_video": has_video,
+        "has_audio": has_audio,
+        "filesize": f.get("filesize") or f.get("filesize_approx"),
+        "note": f.get("format_note"),
+        "vcodec": f.get("vcodec"),
+        "acodec": f.get("acodec"),
+    }
 
 
 def fetch_info(url: str) -> dict:
-    """Extract metadata only — no download."""
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-    }
-
-    # Apply specialized routing based on the target platform
-    if "facebook.com" in url or "fb.watch" in url:
-        ydl_opts["proxy"] = PROXY_URL
-    elif "youtube.com" in url or "youtu.be" in url:
-        ydl_opts["extractor_args"] = {
-            "youtubepot-bgutilhttp": {
-                "base_url": [POT_PROVIDER_URL]
-            }
-        }
+    """Extract metadata and useful media formats without downloading."""
+    opts = _base_options()
+    opts["skip_download"] = True
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        raise UnsupportedURLError(str(e)) from e
+    except yt_dlp.utils.DownloadError as exc:
+        raise UnsupportedURLError(str(exc)) from exc
+
+    if not info:
+        raise UnsupportedURLError("No media information was returned.")
 
     formats = []
-    for f in info.get("formats", []) or []:
-        if f.get("vcodec") in (None, "none") and f.get("acodec") in (None, "none"):
-            continue  # skip storyboards / non-media formats
-        formats.append({
-            "format_id": f.get("format_id"),
-            "ext": f.get("ext"),
-            "resolution": f.get("resolution") or (f"{f['height']}p" if f.get("height") else None),
-            "has_video": f.get("vcodec") not in (None, "none"),
-            "has_audio": f.get("acodec") not in (None, "none"),
-            "filesize": f.get("filesize") or f.get("filesize_approx"),
-            "note": f.get("format_note"),
-        })
+    seen = set()
+    for raw in info.get("formats", []) or []:
+        item = _format_info(raw)
+        if not item or not item["format_id"]:
+            continue
+        # Don't flood the UI with duplicate format IDs.
+        if item["format_id"] in seen:
+            continue
+        seen.add(item["format_id"])
+        formats.append(item)
+
+    # Prefer useful video formats first, highest resolution first, then audio.
+    formats.sort(key=lambda f: (
+        0 if f["has_video"] else 1,
+        -(f["height"] or 0),
+        0 if f["has_audio"] else 1,
+        f["ext"] or "",
+    ))
 
     return {
-        "title": info.get("title", "untitled"),
+        "title": info.get("title") or "untitled",
         "thumbnail": info.get("thumbnail"),
         "duration": info.get("duration"),
-        "uploader": info.get("uploader"),
-        "extractor": info.get("extractor"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "extractor": info.get("extractor_key") or info.get("extractor"),
+        "webpage_url": info.get("webpage_url") or url,
         "formats": formats,
     }
 
@@ -84,46 +128,43 @@ def download_media(
     job_id: str,
     format_id: str | None = None,
     audio_only: bool = False,
+    progress_hook=None,
 ) -> tuple[str, str]:
-    """Downloads the media. Returns (filepath_on_disk, display_filename)."""
+    """Download media with yt-dlp and return (filepath, display filename)."""
     os.makedirs(output_dir, exist_ok=True)
     outtmpl = os.path.join(output_dir, f"{job_id}.%(ext)s")
 
-    ydl_opts = {
+    opts = _base_options()
+    opts.update({
         "outtmpl": outtmpl,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-    }
+        "overwrites": True,
+        "continuedl": True,
+    })
 
-    if audio_only:
-        ydl_opts["format"] = "bestaudio/best"
-        ydl_opts["postprocessors"] = [{
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
+
+    if audio_only or format_id == "audio-only":
+        opts["format"] = "bestaudio/best"
+        opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
+    elif format_id:
+        # A selected video-only format is paired with the best available audio.
+        # If the selected format already contains audio, it is used as-is.
+        opts["format"] = f"{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best"
+        opts["merge_output_format"] = "mp4"
     else:
-        ydl_opts["merge_output_format"] = "mp4"
-        ydl_opts["format"] = (
-            f"{format_id}/bestvideo+bestaudio/best" if format_id else "bestvideo+bestaudio/best"
-        )
-
-    # Apply specialized routing based on the target platform
-    if "facebook.com" in url or "fb.watch" in url:
-        ydl_opts["proxy"] = PROXY_URL
-    elif "youtube.com" in url or "youtu.be" in url:
-        ydl_opts["extractor_args"] = {
-            "youtubepot-bgutilhttp": {
-                "base_url": [POT_PROVIDER_URL]
-            }
-        }
+        opts["format"] = "bestvideo+bestaudio/best"
+        opts["merge_output_format"] = "mp4"
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-    except yt_dlp.utils.DownloadError as e:
-        raise UnsupportedURLError(str(e)) from e
+    except yt_dlp.utils.DownloadError as exc:
+        raise UnsupportedURLError(str(exc)) from exc
 
     filepath = _find_downloaded_file(output_dir, job_id)
     if not filepath:
