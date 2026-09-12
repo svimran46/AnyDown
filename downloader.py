@@ -87,7 +87,7 @@ def _youtube_options(ydl_opts: dict) -> None:
     # They are harmless when the runtime/provider is unavailable; yt-dlp will
     # report the exact missing dependency in its error.
     ydl_opts.setdefault("remote_components", ["ejs:github"])
-    ydl_opts.setdefault("js_runtimes", [os.getenv("YTDLP_JS_RUNTIME", "node")])
+    ydl_opts.setdefault("js_runtimes", {os.getenv("YTDLP_JS_RUNTIME", "node"): {}})
 
 
 def _base_options() -> dict:
