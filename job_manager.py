@@ -1,4 +1,6 @@
-"""Thread-safe in-memory job tracking for AnyDown."""
+"""Thread-safe in-memory job tracking for a single AnyDown instance."""
+
+from __future__ import annotations
 
 import os
 import time
@@ -23,9 +25,9 @@ class Job:
     filepath: str | None = None
     filename: str | None = None
     error: str | None = None
-    progress: float = 0.0
+    progress: float | None = None
     downloaded_bytes: int = 0
-    total_bytes: int | None = None
+    total_bytes: int = 0
     speed: float | None = None
     eta: int | None = None
     created_at: float = field(default_factory=time.time)
@@ -35,7 +37,7 @@ class Job:
 class JobManager:
     def __init__(self, file_ttl_seconds: int = 1800):
         self._jobs: dict[str, Job] = {}
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
         self.file_ttl_seconds = file_ttl_seconds
 
     def create_job(self, url: str) -> Job:
@@ -58,42 +60,12 @@ class JobManager:
                     setattr(job, key, value)
             job.updated_at = time.time()
 
-    def update_progress(self, job_id: str, data: dict) -> None:
-        status = data.get("status")
-        downloaded = data.get("downloaded_bytes") or 0
-        total = data.get("total_bytes") or data.get("total_bytes_estimate")
-        speed = data.get("speed")
-        eta = data.get("eta")
-        percent = 0.0
-        if total and total > 0:
-            percent = max(0.0, min(100.0, downloaded * 100.0 / total))
-        elif data.get("_percent_str"):
-            try:
-                percent = float(str(data["_percent_str"]).replace("%", "").strip())
-            except ValueError:
-                pass
-
-        updates = {
-            "progress": percent,
-            "downloaded_bytes": int(downloaded),
-            "total_bytes": int(total) if total else None,
-            "speed": float(speed) if speed else None,
-            "eta": int(eta) if eta is not None else None,
-        }
-        if status == "downloading":
-            updates["status"] = JobStatus.DOWNLOADING
-
-        self.update(job_id, **updates)
-
-
-
     def cleanup_expired(self) -> None:
         now = time.time()
         with self._lock:
             expired_ids = [
                 jid for jid, job in self._jobs.items()
                 if now - job.created_at > self.file_ttl_seconds
-                and job.status in (JobStatus.COMPLETED, JobStatus.FAILED)
             ]
             expired_jobs = [self._jobs.pop(jid) for jid in expired_ids]
 

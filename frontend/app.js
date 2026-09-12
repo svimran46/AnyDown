@@ -169,7 +169,12 @@
     const res = await fetch("/api/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, format_id: audioOnly ? null : formatId, audio_only: audioOnly }),
+      body: JSON.stringify({
+        url,
+        format_id: audioOnly ? null : formatId,
+        format_has_audio: audioOnly ? false : !!state.formats.find((f) => f.format_id === formatId)?.has_audio,
+        audio_only: audioOnly
+      }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Couldn't start the download.");
@@ -215,7 +220,10 @@
         state.pollHandle = setTimeout(tick, 1200);
       } else if (data.status === "downloading") {
         setTally("active");
-        els.statusText.textContent = "Downloading…";
+        const pct = typeof data.progress === "number" ? ` ${data.progress.toFixed(0)}%` : "";
+        const speed = data.speed ? ` · ${formatFileSize(data.speed)}/s` : "";
+        const eta = data.eta ? ` · ${data.eta}s` : "";
+        els.statusText.textContent = `Downloading…${pct}${speed}${eta}`;
         state.pollHandle = setTimeout(tick, 1200);
       } else if (data.status === "completed") {
         setTally("done");

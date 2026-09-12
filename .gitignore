@@ -7,12 +7,17 @@ env/
 .env.*
 !.env.example
 
-# Runtime downloads
-/downloads/*
-!/downloads/.gitkeep
+# Runtime output
+/downloads/
+*.part
+*.ytdl
 
-# OS / editor files
+# Local secrets
+cookies.txt
+youtube_cookies.txt
+*.cookies.txt
+
+# OS/editor
 .DS_Store
-Thumbs.db
 .vscode/
 .idea/

@@ -1,123 +1,205 @@
-"""yt-dlp based media extraction and downloading for AnyDown."""
+"""yt-dlp based media extraction/downloading for AnyDown."""
+
+from __future__ import annotations
 
 import os
 import re
+from typing import Callable
 from urllib.parse import urlparse
 
 import yt_dlp
-
-
-PROXY_URL = os.getenv("DOWNLOADER_PROXY_URL", "").strip() or None
-POT_PROVIDER_URL = os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip() or None
 
 
 class UnsupportedURLError(Exception):
     """Raised when yt-dlp cannot extract or download a URL."""
 
 
+# Secrets/configuration are supplied by the deployment environment.
+FACEBOOK_PROXY_URL = os.getenv("FACEBOOK_PROXY_URL", "").strip()
+YTDLP_POT_PROVIDER_URL = os.getenv("YTDLP_POT_PROVIDER_URL", "").strip()
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+YTDLP_USER_AGENT = os.getenv(
+    "YTDLP_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+)
+
+_YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be"}
+_FACEBOOK_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "fb.watch", "www.fb.watch"}
+
+
+def _host(url: str) -> str:
+    return (urlparse(url).hostname or "").lower().rstrip(".")
+
+
+def is_youtube(url: str) -> bool:
+    host = _host(url)
+    return host in _YOUTUBE_HOSTS or host.endswith(".youtube.com")
+
+
+def is_facebook(url: str) -> bool:
+    host = _host(url)
+    return host in _FACEBOOK_HOSTS or host.endswith(".facebook.com")
+
+
 def _sanitize_filename(name: str) -> str:
-    name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "_", name).strip().strip(".")
+    name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "_", name).strip()
     return name[:150] if name else "download"
 
 
 def _find_downloaded_file(output_dir: str, job_id: str) -> str | None:
-    matches = []
+    candidates = []
     for fname in os.listdir(output_dir):
-        if fname.startswith(job_id + ".") and not fname.endswith(('.part', '.ytdl')):
-            path = os.path.join(output_dir, fname)
-            if os.path.isfile(path):
-                matches.append(path)
-    if not matches:
+        if fname.startswith(job_id + ".") and not fname.endswith(".part"):
+            candidates.append(os.path.join(output_dir, fname))
+    if not candidates:
         return None
-    return max(matches, key=os.path.getmtime)
+    return max(candidates, key=os.path.getmtime)
+
+
+def _youtube_options(ydl_opts: dict) -> None:
+    """Add current YouTube helpers when configured/available."""
+    extractor_args = ydl_opts.setdefault("extractor_args", {})
+
+    # Current yt-dlp guidance recommends a PO-token provider for mweb/GVS.
+    if YTDLP_POT_PROVIDER_URL:
+        extractor_args["youtubepot-bgutilhttp"] = {
+            "base_url": [YTDLP_POT_PROVIDER_URL]
+        }
+        extractor_args["youtube"] = {
+            "player_client": ["mweb"]
+        }
+
+    # Cookies are optional and MUST be supplied as a server-side secret file.
+    # Never accept cookies from website visitors or commit this file to Git.
+    if YOUTUBE_COOKIES_FILE:
+        if os.path.isfile(YOUTUBE_COOKIES_FILE):
+            ydl_opts["cookiefile"] = YOUTUBE_COOKIES_FILE
+        else:
+            # Fail loudly enough to make Render configuration mistakes obvious.
+            raise UnsupportedURLError(
+                f"YOUTUBE_COOKIES_FILE is configured but the file does not exist: "
+                f"{YOUTUBE_COOKIES_FILE}"
+            )
+
+    # yt-dlp's current YouTube support uses EJS + a JS runtime. If the runtime
+    # is present, these options allow the current solver scripts to be fetched.
+    # They are harmless when the runtime/provider is unavailable; yt-dlp will
+    # report the exact missing dependency in its error.
+    ydl_opts.setdefault("remote_components", ["ejs:github"])
+    ydl_opts.setdefault("js_runtimes", [os.getenv("YTDLP_JS_RUNTIME", "node")])
 
 
 def _base_options() -> dict:
-    opts = {
+    return {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "socket_timeout": 20,
         "retries": 3,
         "fragment_retries": 3,
-        "socket_timeout": 20,
-        "file_access_retries": 3,
-        "continuedl": True,
+        "concurrent_fragment_downloads": 4,
+        "http_headers": {"User-Agent": YTDLP_USER_AGENT},
     }
-    if PROXY_URL:
-        # A proxy is useful for deployments that need it; it is never hard-coded.
-        opts["proxy"] = PROXY_URL
-    if POT_PROVIDER_URL:
-        opts["extractor_args"] = {
-            "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}
-        }
-    return opts
 
 
-def _format_info(f: dict) -> dict | None:
-    has_video = f.get("vcodec") not in (None, "none")
-    has_audio = f.get("acodec") not in (None, "none")
-    if not has_video and not has_audio:
-        return None
+def _apply_platform_options(url: str, ydl_opts: dict) -> None:
+    if is_youtube(url):
+        _youtube_options(ydl_opts)
+    elif is_facebook(url) and FACEBOOK_PROXY_URL:
+        ydl_opts["proxy"] = FACEBOOK_PROXY_URL
 
-    height = f.get("height")
-    resolution = f.get("resolution") or (f"{height}p" if height else None)
-    return {
-        "format_id": str(f.get("format_id")) if f.get("format_id") is not None else None,
-        "ext": f.get("ext"),
-        "resolution": resolution,
-        "height": height,
-        "width": f.get("width"),
-        "fps": f.get("fps"),
-        "has_video": has_video,
-        "has_audio": has_audio,
-        "filesize": f.get("filesize") or f.get("filesize_approx"),
-        "note": f.get("format_note"),
-        "vcodec": f.get("vcodec"),
-        "acodec": f.get("acodec"),
-    }
+
+def _friendly_error(error: Exception) -> str:
+    text = str(error)
+    lower = text.lower()
+
+    if "sign in to confirm you're not a bot" in lower or "confirm you're not a bot" in lower:
+        if YTDLP_POT_PROVIDER_URL and YOUTUBE_COOKIES_FILE:
+            return (
+                "YouTube rejected the server session as automated. The configured PO-token "
+                "provider and cookie session were both supplied, so this is likely an "
+                "IP/session block. Try again later or use a different server/IP."
+            )
+        if not YTDLP_POT_PROVIDER_URL:
+            return (
+                "YouTube rejected this server as automated. Configure a reachable bgutil "
+                "PO-token provider with YTDLP_POT_PROVIDER_URL. If the video still requires "
+                "authentication, use a server-side YouTube cookies secret file; never paste "
+                "cookies into the website."
+            )
+        return (
+            "YouTube rejected this server as automated. The PO-token provider is configured, "
+            "but this video/session may also require authenticated cookies."
+        )
+
+    if "sign in to confirm your age" in lower or "age-restricted" in lower:
+        return "This YouTube video requires an authenticated session. Configure YOUTUBE_COOKIES_FILE on the server."
+
+    if "requested format is not available" in lower:
+        return "That format is no longer available. Fetch the URL again and choose another quality."
+
+    if "ffmpeg" in lower and "not found" in lower:
+        return "FFmpeg is missing on the server. Install the FFmpeg binary and redeploy."
+
+    return text
 
 
 def fetch_info(url: str) -> dict:
-    """Extract metadata and useful media formats without downloading."""
-    opts = _base_options()
-    opts["skip_download"] = True
+    """Extract metadata and normalized media formats without downloading."""
+    ydl_opts = _base_options()
+    ydl_opts.update({"skip_download": True})
+    _apply_platform_options(url, ydl_opts)
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
-        raise UnsupportedURLError(str(exc)) from exc
-
-    if not info:
-        raise UnsupportedURLError("No media information was returned.")
+        raise UnsupportedURLError(_friendly_error(exc)) from exc
 
     formats = []
     seen = set()
-    for raw in info.get("formats", []) or []:
-        item = _format_info(raw)
-        if not item or not item["format_id"]:
+    for f in info.get("formats", []) or []:
+        has_video = f.get("vcodec") not in (None, "none")
+        has_audio = f.get("acodec") not in (None, "none")
+        if not has_video and not has_audio:
             continue
-        # Don't flood the UI with duplicate format IDs.
-        if item["format_id"] in seen:
-            continue
-        seen.add(item["format_id"])
-        formats.append(item)
 
-    # Prefer useful video formats first, highest resolution first, then audio.
+        # Keep useful media streams; storyboards/images are filtered above.
+        fmt_id = str(f.get("format_id") or "")
+        if not fmt_id:
+            continue
+        key = (fmt_id, f.get("ext"), f.get("height"), has_video, has_audio)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        formats.append({
+            "format_id": fmt_id,
+            "ext": f.get("ext"),
+            "resolution": f.get("resolution") or (
+                f"{f['height']}p" if f.get("height") else None
+            ),
+            "height": f.get("height"),
+            "has_video": has_video,
+            "has_audio": has_audio,
+            "filesize": f.get("filesize") or f.get("filesize_approx"),
+            "note": f.get("format_note"),
+        })
+
+    # Put useful video formats first, then audio formats.
     formats.sort(key=lambda f: (
         0 if f["has_video"] else 1,
-        -(f["height"] or 0),
+        -(f.get("height") or 0),
         0 if f["has_audio"] else 1,
-        f["ext"] or "",
     ))
 
     return {
-        "title": info.get("title") or "untitled",
+        "title": info.get("title", "untitled"),
         "thumbnail": info.get("thumbnail"),
         "duration": info.get("duration"),
-        "uploader": info.get("uploader") or info.get("channel"),
-        "extractor": info.get("extractor_key") or info.get("extractor"),
-        "webpage_url": info.get("webpage_url") or url,
+        "uploader": info.get("uploader"),
+        "extractor": info.get("extractor"),
         "formats": formats,
     }
 
@@ -127,44 +209,63 @@ def download_media(
     output_dir: str,
     job_id: str,
     format_id: str | None = None,
+    format_has_audio: bool = False,
     audio_only: bool = False,
-    progress_hook=None,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> tuple[str, str]:
-    """Download media with yt-dlp and return (filepath, display filename)."""
+    """Download media. Returns (filepath_on_disk, display_filename)."""
     os.makedirs(output_dir, exist_ok=True)
     outtmpl = os.path.join(output_dir, f"{job_id}.%(ext)s")
 
-    opts = _base_options()
-    opts.update({
+    def progress_hook(data: dict) -> None:
+        if not progress_callback:
+            return
+        status = data.get("status")
+        downloaded = data.get("downloaded_bytes") or 0
+        total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+        percent = (downloaded / total * 100.0) if total else None
+        progress_callback({
+            "status": status,
+            "percent": percent,
+            "downloaded_bytes": downloaded,
+            "total_bytes": total,
+            "speed": data.get("speed"),
+            "eta": data.get("eta"),
+            "filename": data.get("filename"),
+        })
+
+    ydl_opts = _base_options()
+    ydl_opts.update({
         "outtmpl": outtmpl,
-        "overwrites": True,
-        "continuedl": True,
+        "progress_hooks": [progress_hook],
     })
 
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
-
-    if audio_only or format_id == "audio-only":
-        opts["format"] = "bestaudio/best"
-        opts["postprocessors"] = [{
+    if audio_only:
+        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
-    elif format_id:
-        # A selected video-only format is paired with the best available audio.
-        # If the selected format already contains audio, it is used as-is.
-        opts["format"] = f"{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best"
-        opts["merge_output_format"] = "mp4"
     else:
-        opts["format"] = "bestvideo+bestaudio/best"
-        opts["merge_output_format"] = "mp4"
+        ydl_opts["merge_output_format"] = "mp4"
+        if format_id:
+            # Video-only formats need best audio merged; combined formats can
+            # be downloaded directly. The frontend tells us which case applies.
+            if format_has_audio:
+                ydl_opts["format"] = f"{format_id}/bestvideo+bestaudio/best"
+            else:
+                ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best"
+        else:
+            ydl_opts["format"] = "bestvideo+bestaudio/best"
+
+    _apply_platform_options(url, ydl_opts)
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as exc:
-        raise UnsupportedURLError(str(exc)) from exc
+        raise UnsupportedURLError(_friendly_error(exc)) from exc
 
     filepath = _find_downloaded_file(output_dir, job_id)
     if not filepath:
