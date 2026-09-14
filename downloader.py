@@ -21,6 +21,17 @@ formatter = logging.Formatter(
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+# Additional logger for AnyDown-specific diagnostics
+diagnostic_logger = logging.getLogger("anydown.diagnostics")
+diagnostic_logger.setLevel(logging.DEBUG)
+diagnostic_handler = logging.StreamHandler()
+diagnostic_handler.setLevel(logging.DEBUG)
+diagnostic_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+diagnostic_handler.setFormatter(diagnostic_formatter)
+diagnostic_logger.addHandler(diagnostic_handler)
+
 
 class UnsupportedURLError(Exception):
     """Raised when yt-dlp cannot extract or download a URL."""
@@ -75,12 +86,27 @@ def _youtube_options(ydl_opts: dict) -> None:
 
     # Current yt-dlp guidance recommends a PO-token provider for mweb/GVS.
     if YTDLP_POT_PROVIDER_URL:
+        diagnostic_logger.info(
+            f"[PO-TOKEN] bgutil POT provider configured: {YTDLP_POT_PROVIDER_URL}"
+        )
+        diagnostic_logger.info(
+            "[PO-TOKEN] Setting up youtubepot-bgutilhttp extractor args for mweb client"
+        )
+        
         extractor_args["youtubepot-bgutilhttp"] = {
             "base_url": [YTDLP_POT_PROVIDER_URL]
         }
         extractor_args["youtube"] = {
             "player_client": ["mweb"]
         }
+        
+        diagnostic_logger.info(
+            "[PO-TOKEN] mweb player client configured; awaiting token request during extraction"
+        )
+    else:
+        diagnostic_logger.warning(
+            "[PO-TOKEN] No bgutil POT provider URL configured (YTDLP_POT_PROVIDER_URL not set)"
+        )
 
     # Cookies are optional and MUST be supplied as a server-side secret file.
     # Never accept cookies from website visitors or commit this file to Git.
@@ -103,7 +129,7 @@ def _youtube_options(ydl_opts: dict) -> None:
 
 
 def _base_options() -> dict:
-    return {
+    opts = {
         "quiet": False,
         "verbose": True,
         "no_warnings": False,
@@ -115,10 +141,19 @@ def _base_options() -> dict:
         "http_headers": {"User-Agent": YTDLP_USER_AGENT},
         "logger": logger,
     }
+    
+    # Log diagnostic info about PO-token provider availability at startup
+    if YTDLP_POT_PROVIDER_URL:
+        diagnostic_logger.debug(
+            f"[PO-TOKEN] Base options prepared with bgutil provider: {YTDLP_POT_PROVIDER_URL}"
+        )
+    
+    return opts
 
 
 def _apply_platform_options(url: str, ydl_opts: dict) -> None:
     if is_youtube(url):
+        diagnostic_logger.info(f"[EXTRACTION] YouTube URL detected: {url}")
         _youtube_options(ydl_opts)
     elif is_facebook(url) and FACEBOOK_PROXY_URL:
         ydl_opts["proxy"] = FACEBOOK_PROXY_URL
@@ -129,6 +164,17 @@ def _friendly_error(error: Exception) -> str:
     lower = text.lower()
 
     if "sign in to confirm you're not a bot" in lower or "confirm you're not a bot" in lower:
+        # Log diagnostic info about the failure
+        if YTDLP_POT_PROVIDER_URL:
+            diagnostic_logger.error(
+                "[PO-TOKEN] mweb extraction failed with LOGIN_REQUIRED despite bgutil provider. "
+                "Check: bgutil connectivity, token acquisition, and video/session restrictions."
+            )
+        else:
+            diagnostic_logger.error(
+                "[PO-TOKEN] LOGIN_REQUIRED and no bgutil provider configured."
+            )
+        
         if YTDLP_POT_PROVIDER_URL and YOUTUBE_COOKIES_FILE:
             return (
                 "YouTube rejected the server session as automated. The configured PO-token "
@@ -165,10 +211,15 @@ def fetch_info(url: str) -> dict:
     ydl_opts.update({"skip_download": True})
     _apply_platform_options(url, ydl_opts)
 
+    diagnostic_logger.info("[EXTRACTION] Starting fetch_info extraction")
+    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            diagnostic_logger.debug("[PO-TOKEN] YoutubeDL instance created; calling extract_info")
             info = ydl.extract_info(url, download=False)
+            diagnostic_logger.info("[EXTRACTION] fetch_info extraction completed successfully")
     except yt_dlp.utils.DownloadError as exc:
+        diagnostic_logger.error(f"[EXTRACTION] fetch_info failed: {str(exc)[:100]}")
         raise UnsupportedURLError(_friendly_error(exc)) from exc
 
     formats = []
@@ -275,10 +326,15 @@ def download_media(
 
     _apply_platform_options(url, ydl_opts)
 
+    diagnostic_logger.info("[EXTRACTION] Starting download_media extraction")
+    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            diagnostic_logger.debug("[PO-TOKEN] YoutubeDL instance created; calling extract_info for download")
             info = ydl.extract_info(url, download=True)
+            diagnostic_logger.info("[EXTRACTION] download_media extraction completed successfully")
     except yt_dlp.utils.DownloadError as exc:
+        diagnostic_logger.error(f"[EXTRACTION] download_media failed: {str(exc)[:100]}")
         raise UnsupportedURLError(_friendly_error(exc)) from exc
 
     filepath = _find_downloaded_file(output_dir, job_id)
