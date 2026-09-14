@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Callable
 from urllib.parse import urlparse
 
 import yt_dlp
+
+# Configure logging for yt-dlp debug output
+logger = logging.getLogger("yt_dlp")
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 
 class UnsupportedURLError(Exception):
@@ -92,14 +104,16 @@ def _youtube_options(ydl_opts: dict) -> None:
 
 def _base_options() -> dict:
     return {
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "verbose": True,
+        "no_warnings": False,
         "noplaylist": True,
         "socket_timeout": 20,
         "retries": 3,
         "fragment_retries": 3,
         "concurrent_fragment_downloads": 4,
         "http_headers": {"User-Agent": YTDLP_USER_AGENT},
+        "logger": logger,
     }
 
 
