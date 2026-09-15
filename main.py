@@ -10,7 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,6 +26,7 @@ FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "5"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+MAX_FILESIZE_BYTES = int(os.getenv("MAX_FILESIZE_BYTES", str(2 * 1024 * 1024 * 1024)))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -91,6 +92,18 @@ def _validate_public_url(url: str) -> None:
     if ip and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast):
         raise HTTPException(status_code=400, detail="Private or local network URLs are not supported.")
 
+    # Hostname DNS resolution: validate every resolved address.
+    if not ip:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            raise HTTPException(status_code=400, detail="Unable to resolve hostname")
+        
+        for family, socktype, proto, canonname, sockaddr in infos:
+            resolved_ip = ipaddress.ip_address(sockaddr[0])
+            if resolved_ip.is_private or resolved_ip.is_loopback or resolved_ip.is_link_local or resolved_ip.is_reserved or resolved_ip.is_multicast or resolved_ip.is_unspecified:
+                raise HTTPException(status_code=400, detail="Private or local network URLs are not supported.")
+
     # Avoid obvious credential-bearing URLs.
     if parsed.username or parsed.password:
         raise HTTPException(status_code=400, detail="URLs containing embedded credentials are not supported.")
@@ -139,64 +152,59 @@ def get_info(payload: InfoRequest):
 
 
 @app.post("/api/download")
-async def start_download(payload: DownloadRequest, background_tasks: BackgroundTasks, request: Request):
+async def start_download(payload: DownloadRequest, request: Request):
     _validate_public_url(payload.url)
     client_ip = request.client.host if request.client else "unknown"
     _throttle(client_ip)
 
     if payload.format_id:
-        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+._-~")
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
         if not 1 <= len(payload.format_id) <= 100 or any(c not in allowed for c in payload.format_id):
             raise HTTPException(status_code=400, detail="Invalid format_id.")
 
     job = job_manager.create_job(payload.url)
 
-    def run_download():
-        async def runner():
-            async with _download_semaphore:
-                job_manager.update(job.id, status=JobStatus.DOWNLOADING)
-                try:
-                    def progress(data: dict):
-                        status = data.get("status")
-                        job_manager.update(
-                            job.id,
-                            progress=data.get("percent"),
-                            downloaded_bytes=int(data.get("downloaded_bytes") or 0),
-                            total_bytes=int(data.get("total_bytes") or 0),
-                            speed=data.get("speed"),
-                            eta=data.get("eta"),
-                            status=JobStatus.DOWNLOADING if status != "finished" else JobStatus.DOWNLOADING,
-                        )
+    async with _download_semaphore:
+        job_manager.update(job.id, status=JobStatus.DOWNLOADING)
+        try:
+            def progress(data: dict):
+                status = data.get("status")
+                job_manager.update(
+                    job.id,
+                    progress=data.get("percent"),
+                    downloaded_bytes=int(data.get("downloaded_bytes") or 0),
+                    total_bytes=int(data.get("total_bytes") or 0),
+                    speed=data.get("speed"),
+                    eta=data.get("eta"),
+                    status=JobStatus.DOWNLOADING if status != "finished" else JobStatus.DOWNLOADING,
+                )
 
-                    filepath, display_name = await asyncio.to_thread(
-                        download_media,
-                        payload.url,
-                        OUTPUT_DIR,
-                        job.id,
-                        payload.format_id,
-                        payload.format_has_audio,
-                        payload.audio_only,
-                        progress,
-                    )
-                    job_manager.update(
-                        job.id,
-                        status=JobStatus.COMPLETED,
-                        filepath=filepath,
-                        filename=display_name,
-                        progress=100.0,
-                    )
-                except UnsupportedURLError as exc:
-                    job_manager.update(job.id, status=JobStatus.FAILED, error=str(exc))
-                except Exception as exc:
-                    job_manager.update(
-                        job.id,
-                        status=JobStatus.FAILED,
-                        error=f"Unexpected error: {type(exc).__name__}: {exc}",
-                    )
+            filepath, display_name = await asyncio.to_thread(
+                download_media,
+                payload.url,
+                OUTPUT_DIR,
+                job.id,
+                payload.format_id,
+                payload.format_has_audio,
+                payload.audio_only,
+                progress,
+            )
+            job_manager.update(
+                job.id,
+                status=JobStatus.COMPLETED,
+                filepath=filepath,
+                filename=display_name,
+                progress=100.0,
+            )
+        except UnsupportedURLError as exc:
+            job_manager.update(job.id, status=JobStatus.FAILED, error=str(exc))
+        except Exception as exc:
+            job_manager.update(
+                job.id,
+                status=JobStatus.FAILED,
+                error=f"Unexpected error: {type(exc).__name__}: {exc}",
+            )
 
-        asyncio.run(runner())
-
-    background_tasks.add_task(run_download)
     return {"job_id": job.id, "status": job.status}
 
 
