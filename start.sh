@@ -11,7 +11,18 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
-# Give the provider a moment to bind before starting the API.
-sleep 1
+# Poll for provider readiness instead of a simple sleep.
+PROVIDER_READY=0
+for i in $(seq 1 60); do
+  if curl -sf http://127.0.0.1:4416/ping >/dev/null 2>&1; then
+    PROVIDER_READY=1
+    break
+  fi
+  sleep 0.5
+done
+if [ "$PROVIDER_READY" -ne 1 ]; then
+  echo "bgutil POT provider failed to start within 30s; aborting." >&2
+  exit 1
+fi
 
 exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-10000}"
