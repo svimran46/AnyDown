@@ -13,24 +13,26 @@ import yt_dlp
 # Configure logging for yt-dlp debug output
 logger = logging.getLogger("yt_dlp")
 logger.setLevel(logging.DEBUG)
-handler = logging.StreamHandler()
-handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # Additional logger for AnyDown-specific diagnostics
 diagnostic_logger = logging.getLogger("anydown.diagnostics")
 diagnostic_logger.setLevel(logging.DEBUG)
-diagnostic_handler = logging.StreamHandler()
-diagnostic_handler.setLevel(logging.DEBUG)
-diagnostic_formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-diagnostic_handler.setFormatter(diagnostic_formatter)
-diagnostic_logger.addHandler(diagnostic_handler)
+if not diagnostic_logger.handlers:
+    diagnostic_handler = logging.StreamHandler()
+    diagnostic_handler.setLevel(logging.DEBUG)
+    diagnostic_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    diagnostic_handler.setFormatter(diagnostic_formatter)
+    diagnostic_logger.addHandler(diagnostic_handler)
 
 
 class UnsupportedURLError(Exception):
@@ -46,6 +48,7 @@ YTDLP_USER_AGENT = os.getenv(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
 )
+YTDLP_VERBOSE = os.getenv("YTDLP_VERBOSE", "false").lower() in {"true", "1", "yes"}
 
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be"}
 _FACEBOOK_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "fb.watch", "www.fb.watch"}
@@ -70,13 +73,28 @@ def _sanitize_filename(name: str) -> str:
     return name[:150] if name else "download"
 
 
-def _find_downloaded_file(output_dir: str, job_id: str) -> str | None:
+def _find_downloaded_file(output_dir: str, job_id: str, info: dict | None = None) -> str | None:
+    """Find downloaded file by prepare_filename or directory scan fallback."""
+    if info:
+        try:
+            with yt_dlp.YoutubeDL({"outtmpl": os.path.join(output_dir, f"{job_id}.%(ext)s")}) as ydl:
+                prepared_path = ydl.prepare_filename(info)
+                if os.path.exists(prepared_path):
+                    return prepared_path
+        except Exception:
+            pass
+    
+    # Fallback: directory scan with preference for base name match
     candidates = []
+    expected_base = job_id + "."
     for fname in os.listdir(output_dir):
-        if fname.startswith(job_id + ".") and not fname.endswith(".part"):
+        if fname.startswith(expected_base) and not fname.endswith(".part"):
             candidates.append(os.path.join(output_dir, fname))
+    
     if not candidates:
         return None
+    
+    # Prefer exact matches over mtime heuristic
     return max(candidates, key=os.path.getmtime)
 
 
@@ -130,9 +148,9 @@ def _youtube_options(ydl_opts: dict) -> None:
 
 def _base_options() -> dict:
     opts = {
-        "quiet": False,
-        "verbose": True,
-        "no_warnings": False,
+        "quiet": True,
+        "verbose": YTDLP_VERBOSE,
+        "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 20,
         "retries": 3,
@@ -337,7 +355,7 @@ def download_media(
         diagnostic_logger.error(f"[EXTRACTION] download_media failed: {str(exc)[:100]}")
         raise UnsupportedURLError(_friendly_error(exc)) from exc
 
-    filepath = _find_downloaded_file(output_dir, job_id)
+    filepath = _find_downloaded_file(output_dir, job_id, info)
     if not filepath:
         raise UnsupportedURLError("Download finished but the output file could not be located.")
 
