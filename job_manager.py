@@ -31,6 +31,7 @@ class Job:
     speed: float | None = None
     eta: int | None = None
     created_at: float = field(default_factory=time.time)
+    completed_at: float | None = None
     updated_at: float = field(default_factory=time.time)
 
 
@@ -58,15 +59,21 @@ class JobManager:
             for key, value in kwargs.items():
                 if hasattr(job, key):
                     setattr(job, key, value)
+            # Set completed_at when transitioning to COMPLETED
+            if "status" in kwargs and kwargs["status"] == JobStatus.COMPLETED:
+                job.completed_at = time.time()
             job.updated_at = time.time()
 
     def cleanup_expired(self) -> None:
         now = time.time()
         with self._lock:
-            expired_ids = [
-                jid for jid, job in self._jobs.items()
-                if now - job.created_at > self.file_ttl_seconds
-            ]
+            expired_ids = []
+            for jid, job in self._jobs.items():
+                # Only clean up COMPLETED jobs based on completion time
+                if job.status == JobStatus.COMPLETED and job.completed_at is not None:
+                    if now - job.completed_at > self.file_ttl_seconds:
+                        expired_ids.append(jid)
+                # Don't clean up non-completed jobs that should generally not have files
             expired_jobs = [self._jobs.pop(jid) for jid in expired_ids]
 
         for job in expired_jobs:
