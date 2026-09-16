@@ -98,53 +98,134 @@ def _find_downloaded_file(output_dir: str, job_id: str, info: dict | None = None
     return max(candidates, key=os.path.getmtime)
 
 
-def _youtube_options(ydl_opts: dict) -> None:
-    """Add current YouTube helpers when configured/available."""
+def _youtube_options(ydl_opts: dict, client: str | None = None) -> None:
+    """Configure yt-dlp's current YouTube helpers.
+
+    bgutil is installed as the official yt-dlp plugin.  The HTTP provider is
+    only needed for clients that use PO tokens (notably mweb).  Keep the
+    provider available, but don't force mweb for every YouTube request: yt-dlp
+    documents several clients with different requirements and limitations.
+    """
     extractor_args = ydl_opts.setdefault("extractor_args", {})
 
-    # Current yt-dlp guidance recommends a PO-token provider for mweb/GVS.
+    selected_client = client or os.getenv("YOUTUBE_PRIMARY_CLIENT", "mweb").strip() or "mweb"
+    diagnostic_logger.info("[YOUTUBE] Using player client: %s", selected_client)
+
     if YTDLP_POT_PROVIDER_URL:
         diagnostic_logger.info(
-            f"[PO-TOKEN] bgutil POT provider configured: {YTDLP_POT_PROVIDER_URL}"
+            "[PO-TOKEN] bgutil POT provider configured: %s",
+            YTDLP_POT_PROVIDER_URL,
         )
-        diagnostic_logger.info(
-            "[PO-TOKEN] Setting up youtubepot-bgutilhttp extractor args for mweb client"
-        )
-        
         extractor_args["youtubepot-bgutilhttp"] = {
             "base_url": [YTDLP_POT_PROVIDER_URL]
         }
-        extractor_args["youtube"] = {
-            "player_client": ["mweb"]
-        }
-        
+
+    extractor_args["youtube"] = {
+        "player_client": [selected_client]
+    }
+
+    if YTDLP_POT_PROVIDER_URL and selected_client == "mweb":
         diagnostic_logger.info(
-            "[PO-TOKEN] mweb player client configured; awaiting token request during extraction"
-        )
-    else:
-        diagnostic_logger.warning(
-            "[PO-TOKEN] No bgutil POT provider URL configured (YTDLP_POT_PROVIDER_URL not set)"
+            "[PO-TOKEN] mweb selected; bgutil will supply PO tokens when requested"
         )
 
     # Cookies are optional and MUST be supplied as a server-side secret file.
-    # Never accept cookies from website visitors or commit this file to Git.
     if YOUTUBE_COOKIES_FILE:
         if os.path.isfile(YOUTUBE_COOKIES_FILE):
             ydl_opts["cookiefile"] = YOUTUBE_COOKIES_FILE
         else:
-            # Fail loudly enough to make Render configuration mistakes obvious.
             raise UnsupportedURLError(
                 f"YOUTUBE_COOKIES_FILE is configured but the file does not exist: "
                 f"{YOUTUBE_COOKIES_FILE}"
             )
 
-    # yt-dlp's current YouTube support uses EJS + a JS runtime. If the runtime
-    # is present, these options allow the current solver scripts to be fetched.
-    # They are harmless when the runtime/provider is unavailable; yt-dlp will
-    # report the exact missing dependency in its error.
+    # yt-dlp's current YouTube support uses EJS + a JS runtime.
     ydl_opts.setdefault("remote_components", ["ejs:github"])
-    ydl_opts.setdefault("js_runtimes", {os.getenv("YTDLP_JS_RUNTIME", "node"): {}})
+    ydl_opts.setdefault(
+        "js_runtimes", {os.getenv("YTDLP_JS_RUNTIME", "node"): {}}
+    )
 
+
+def _is_youtube_retryable_error(error: Exception) -> bool:
+    """Return True for failures where another YouTube client is worth trying."""
+    text = str(error).lower()
+    markers = (
+        "sign in to confirm you're not a bot",
+        "confirm you're not a bot",
+        "login_required",
+        "http error 403",
+        "http error 429",
+        "forbidden",
+        "temporarily blocked",
+        "requested format is not available",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _youtube_clients() -> list[str]:
+    """Return a small, configurable client fallback chain."""
+    raw = os.getenv("YOUTUBE_CLIENTS", "mweb,tv,web_embedded")
+    clients = []
+    for item in raw.split(","):
+        client = item.strip()
+        if client and client not in clients:
+            clients.append(client)
+    return clients or ["mweb", "tv", "web_embedded"]
+
+
+def _extract_info_with_youtube_fallback(url: str, base_opts: dict, download: bool = False):
+    """Try the configured YouTube clients, falling back only on known blocks."""
+    clients = _youtube_clients()
+    last_error: Exception | None = None
+
+    for index, client in enumerate(clients):
+        opts = dict(base_opts)
+        # Copy nested extractor args so each attempt is independent.
+        opts["extractor_args"] = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in base_opts.get("extractor_args", {}).items()
+        }
+        _youtube_options(opts, client=client)
+
+        # Format IDs can differ between YouTube clients. If the primary client
+        # failed and we are falling back during an actual download, use a
+        # client-neutral best format instead of carrying an incompatible ID.
+        if download and index > 0 and opts.get("format"):
+            has_audio_pp = any(
+                pp.get("key") == "FFmpegExtractAudio"
+                for pp in opts.get("postprocessors", [])
+                if isinstance(pp, dict)
+            )
+            opts["format"] = "bestaudio/best" if has_audio_pp else "bestvideo+bestaudio/best"
+            diagnostic_logger.info(
+                "[YOUTUBE] Fallback client=%s using client-neutral format selector",
+                client,
+            )
+
+        diagnostic_logger.info(
+            "[YOUTUBE] Attempt %d/%d using client=%s",
+            index + 1,
+            len(clients),
+            client,
+        )
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=download)
+            diagnostic_logger.info(
+                "[YOUTUBE] Success using client=%s", client
+            )
+            return info, client
+        except yt_dlp.utils.DownloadError as exc:
+            last_error = exc
+            if index == len(clients) - 1 or not _is_youtube_retryable_error(exc):
+                raise
+            diagnostic_logger.warning(
+                "[YOUTUBE] client=%s failed with a retryable YouTube error; trying next client",
+                client,
+            )
+
+    assert last_error is not None
+    raise last_error
 
 def _base_options() -> dict:
     opts = {
@@ -207,8 +288,9 @@ def _friendly_error(error: Exception) -> str:
                 "cookies into the website."
             )
         return (
-            "YouTube rejected this server as automated. The PO-token provider is configured, "
-            "but this video/session may also require authenticated cookies."
+            "YouTube rejected the available server-side clients for this request. "
+            "AnyDown tried its configured YouTube client fallbacks, but YouTube still "
+            "requires authentication or is blocking this server/IP."
         )
 
     if "sign in to confirm your age" in lower or "age-restricted" in lower:
@@ -227,14 +309,22 @@ def fetch_info(url: str) -> dict:
     """Extract metadata and normalized media formats without downloading."""
     ydl_opts = _base_options()
     ydl_opts.update({"skip_download": True})
-    _apply_platform_options(url, ydl_opts)
 
     diagnostic_logger.info("[EXTRACTION] Starting fetch_info extraction")
-    
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            diagnostic_logger.debug("[PO-TOKEN] YoutubeDL instance created; calling extract_info")
-            info = ydl.extract_info(url, download=False)
+        if is_youtube(url):
+            info, used_client = _extract_info_with_youtube_fallback(
+                url, ydl_opts, download=False
+            )
+            diagnostic_logger.info(
+                "[EXTRACTION] fetch_info completed with YouTube client=%s",
+                used_client,
+            )
+        else:
+            _apply_platform_options(url, ydl_opts)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
             diagnostic_logger.info("[EXTRACTION] fetch_info extraction completed successfully")
     except yt_dlp.utils.DownloadError as exc:
         diagnostic_logger.error(f"[EXTRACTION] fetch_info failed: {str(exc)[:100]}")
@@ -342,14 +432,24 @@ def download_media(
         else:
             ydl_opts["format"] = "bestvideo+bestaudio/best"
 
-    _apply_platform_options(url, ydl_opts)
-
     diagnostic_logger.info("[EXTRACTION] Starting download_media extraction")
-    
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            diagnostic_logger.debug("[PO-TOKEN] YoutubeDL instance created; calling extract_info for download")
-            info = ydl.extract_info(url, download=True)
+        if is_youtube(url):
+            try:
+                info, used_client = _extract_info_with_youtube_fallback(
+                    url, ydl_opts, download=True
+                )
+            except yt_dlp.utils.DownloadError:
+                raise
+            diagnostic_logger.info(
+                "[EXTRACTION] download_media completed with YouTube client=%s",
+                used_client,
+            )
+        else:
+            _apply_platform_options(url, ydl_opts)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
             diagnostic_logger.info("[EXTRACTION] download_media extraction completed successfully")
     except yt_dlp.utils.DownloadError as exc:
         diagnostic_logger.error(f"[EXTRACTION] download_media failed: {str(exc)[:100]}")
