@@ -31,7 +31,7 @@ class Job:
     speed: float | None = None
     eta: int | None = None
     created_at: float = field(default_factory=time.time)
-    completed_at: float | None = None
+    finished_at: float | None = None
     updated_at: float = field(default_factory=time.time)
 
 
@@ -59,29 +59,46 @@ class JobManager:
             for key, value in kwargs.items():
                 if hasattr(job, key):
                     setattr(job, key, value)
-            # Set completed_at when transitioning to COMPLETED
-            if "status" in kwargs and kwargs["status"] == JobStatus.COMPLETED:
-                job.completed_at = time.time()
+            # Stamp the terminal transition so TTL cleanup has a start time
+            # for both COMPLETED and FAILED jobs.
+            if "status" in kwargs and kwargs["status"] in (JobStatus.COMPLETED, JobStatus.FAILED):
+                if job.finished_at is None:
+                    job.finished_at = time.time()
             job.updated_at = time.time()
 
-    def cleanup_expired(self) -> None:
+    def cleanup_expired(self, output_dir: str | None = None) -> None:
+        """Drop expired jobs (completed or failed) and delete their files."""
         now = time.time()
         with self._lock:
-            expired_ids = []
-            for jid, job in self._jobs.items():
-                # Only clean up COMPLETED jobs based on completion time
-                if job.status == JobStatus.COMPLETED and job.completed_at is not None:
-                    if now - job.completed_at > self.file_ttl_seconds:
-                        expired_ids.append(jid)
-                # Don't clean up non-completed jobs that should generally not have files
+            expired_ids = [
+                jid
+                for jid, job in self._jobs.items()
+                if job.finished_at is not None
+                and now - job.finished_at > self.file_ttl_seconds
+            ]
             expired_jobs = [self._jobs.pop(jid) for jid in expired_ids]
 
         for job in expired_jobs:
-            if job.filepath and os.path.exists(job.filepath):
+            if job.filepath:
                 try:
-                    os.remove(job.filepath)
+                    if os.path.exists(job.filepath):
+                        os.remove(job.filepath)
                 except OSError:
                     pass
+
+        # Sweep orphaned temp files from crashed or expired jobs. A leftover
+        # file is removed once it is older than the TTL and its job is gone.
+        if output_dir and os.path.isdir(output_dir):
+            cutoff = now - self.file_ttl_seconds
+            for fname in os.listdir(output_dir):
+                if not (fname.endswith(".part") or fname.endswith(".ytdl")):
+                    continue
+                path = os.path.join(output_dir, fname)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                except OSError:
+                    continue
 
 
 job_manager = JobManager()

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
-import socket
 import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
@@ -17,7 +16,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import yt_dlp
-from downloader import download_media, fetch_info, UnsupportedURLError
+from downloader import (
+    MAX_FILESIZE_BYTES,
+    download_media,
+    fetch_info,
+    UnsupportedURLError,
+)
 from job_manager import JobStatus, job_manager
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,7 +30,6 @@ FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "5"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
-MAX_FILESIZE_BYTES = int(os.getenv("MAX_FILESIZE_BYTES", str(2 * 1024 * 1024 * 1024)))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -36,7 +39,7 @@ _last_request_at: dict[str, float] = {}
 async def _cleanup_loop():
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
-        await asyncio.to_thread(job_manager.cleanup_expired)
+        await asyncio.to_thread(job_manager.cleanup_expired, OUTPUT_DIR)
 
 
 @asynccontextmanager
@@ -75,7 +78,14 @@ class DownloadRequest(BaseModel):
     audio_only: bool = False
 
 
-def _validate_public_url(url: str) -> None:
+def _validate_url_syntax(url: str) -> str:
+    """Cheap, DNS-free URL checks. Returns the validated hostname.
+
+    Deliberately does NOT resolve DNS: getaddrinfo can block for many seconds
+    and must never run on the event loop. DNS is checked separately (async)
+    and is also re-validated at the yt-dlp layer (see downloader.py), because
+    a resolution here cannot prevent a later DNS rebinding anyway.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise HTTPException(status_code=400, detail="Please provide a valid http(s) URL.")
@@ -89,24 +99,60 @@ def _validate_public_url(url: str) -> None:
         ip = ipaddress.ip_address(host)
     except ValueError:
         ip = None
-    if ip and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast):
+    if ip and (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    ):
         raise HTTPException(status_code=400, detail="Private or local network URLs are not supported.")
-
-    # Hostname DNS resolution: validate every resolved address.
-    if not ip:
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except socket.gaierror:
-            raise HTTPException(status_code=400, detail="Unable to resolve hostname")
-        
-        for family, socktype, proto, canonname, sockaddr in infos:
-            resolved_ip = ipaddress.ip_address(sockaddr[0])
-            if resolved_ip.is_private or resolved_ip.is_loopback or resolved_ip.is_link_local or resolved_ip.is_reserved or resolved_ip.is_multicast or resolved_ip.is_unspecified:
-                raise HTTPException(status_code=400, detail="Private or local network URLs are not supported.")
 
     # Avoid obvious credential-bearing URLs.
     if parsed.username or parsed.password:
         raise HTTPException(status_code=400, detail="URLs containing embedded credentials are not supported.")
+
+    return host
+
+
+async def _validate_dns(host: str) -> None:
+    """Resolve the hostname off the event loop and reject private addresses.
+
+    Note this is advisory against SSRF-by-DNS, not a complete rebinding fix;
+    downloader.py also validates each connected address at download time.
+    """
+    import socket
+
+    def _resolve() -> list[str]:
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            return []
+        return [sockaddr[0] for *_, sockaddr in infos]
+
+    addrs = await asyncio.to_thread(_resolve)
+    if not addrs:
+        raise HTTPException(status_code=400, detail="Unable to resolve hostname")
+    for addr in addrs:
+        try:
+            resolved_ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if (
+            resolved_ip.is_private
+            or resolved_ip.is_loopback
+            or resolved_ip.is_link_local
+            or resolved_ip.is_reserved
+            or resolved_ip.is_multicast
+            or resolved_ip.is_unspecified
+        ):
+            raise HTTPException(status_code=400, detail="Private or local network URLs are not supported.")
+
+
+async def _validate_public_url(url: str) -> None:
+    host = _validate_url_syntax(url)
+    await _validate_dns(host)
 
 
 def _throttle(client_ip: str) -> None:
@@ -114,6 +160,11 @@ def _throttle(client_ip: str) -> None:
     previous = _last_request_at.get(client_ip, 0)
     if now - previous < THROTTLE_SECONDS:
         raise HTTPException(status_code=429, detail="Too many requests — please slow down.")
+    if len(_last_request_at) >= 1024:
+        # Bound memory: drop entries old enough that they no longer throttle.
+        for ip, ts in list(_last_request_at.items()):
+            if now - ts >= THROTTLE_SECONDS:
+                del _last_request_at[ip]
     _last_request_at[client_ip] = now
 
 
@@ -139,12 +190,13 @@ def health():
         "pot_provider_configured": bool(os.getenv("YTDLP_POT_PROVIDER_URL", "").strip()),
         "youtube_cookies_configured": bool(os.getenv("YOUTUBE_COOKIES_FILE", "").strip()),
         "max_concurrent_downloads": MAX_CONCURRENT_DOWNLOADS,
+        "max_filesize_bytes": MAX_FILESIZE_BYTES,
     }
 
 
 @app.post("/api/info")
 def get_info(payload: InfoRequest):
-    _validate_public_url(payload.url)
+    _validate_url_syntax(payload.url)
     try:
         return fetch_info(payload.url)
     except UnsupportedURLError as exc:
@@ -153,7 +205,8 @@ def get_info(payload: InfoRequest):
 
 @app.post("/api/download")
 async def start_download(payload: DownloadRequest, request: Request):
-    _validate_public_url(payload.url)
+    # DNS check runs in a worker thread; never block the event loop here.
+    await _validate_public_url(payload.url)
     client_ip = request.client.host if request.client else "unknown"
     _throttle(client_ip)
 
@@ -168,15 +221,16 @@ async def start_download(payload: DownloadRequest, request: Request):
         job_manager.update(job.id, status=JobStatus.DOWNLOADING)
         try:
             def progress(data: dict):
-                status = data.get("status")
+                # Progress can be None when the total size is unknown; the
+                # frontend already handles that. We intentionally do not
+                # rewrite status here: job status is owned by start_download.
                 job_manager.update(
                     job.id,
                     progress=data.get("percent"),
-                    downloaded_bytes=int(data.get("downloaded_bytes") or 0),
-                    total_bytes=int(data.get("total_bytes") or 0),
+                    downloaded_bytes=data.get("downloaded_bytes") or 0,
+                    total_bytes=data.get("total_bytes") or 0,
                     speed=data.get("speed"),
                     eta=data.get("eta"),
-                    status=JobStatus.DOWNLOADING if status != "finished" else JobStatus.DOWNLOADING,
                 )
 
             filepath, display_name = await asyncio.to_thread(

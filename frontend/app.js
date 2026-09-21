@@ -154,15 +154,27 @@
 
   // ---------- API calls ----------
 
+  // Backend error responses are not always JSON; parse defensively.
+  async function parseResponse(res, fallbackMessage) {
+    try {
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || fallbackMessage);
+      return data;
+    } catch (err) {
+      if (err instanceof SyntaxError || err instanceof TypeError) {
+        throw new Error(res.ok ? fallbackMessage : `${fallbackMessage} (HTTP ${res.status})`);
+      }
+      throw err;
+    }
+  }
+
   async function fetchInfo(url) {
     const res = await fetch("/api/info", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Couldn't read that link.");
-    return data;
+    return parseResponse(res, "Couldn't read that link.");
   }
 
   async function startDownload(url, formatId, audioOnly) {
@@ -176,16 +188,12 @@
         audio_only: audioOnly
       }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Couldn't start the download.");
-    return data;
+    return parseResponse(res, "Couldn't start the download.");
   }
 
   async function fetchStatus(jobId) {
     const res = await fetch(`/api/status/${encodeURIComponent(jobId)}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Lost track of that job.");
-    return data;
+    return parseResponse(res, "Lost track of that job.");
   }
 
   // ---------- status polling ----------
@@ -204,13 +212,26 @@
   function pollStatus(jobId) {
     stopPolling();
 
+    let consecutiveErrors = 0;
+    const MAX_RETRIES = 5;
+
     const tick = async () => {
       let data;
       try {
         data = await fetchStatus(jobId);
+        consecutiveErrors = 0;
       } catch (err) {
-        setTally("failed");
-        els.statusText.textContent = err.message;
+        // Transient network hiccups or a restarting server shouldn't kill a
+        // healthy download; only give up after several consecutive failures.
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= MAX_RETRIES) {
+          setTally("failed");
+          els.statusText.textContent = err.message;
+          return;
+        }
+        setTally("active");
+        els.statusText.textContent = `Connection issue — retrying (${consecutiveErrors}/${MAX_RETRIES})…`;
+        state.pollHandle = setTimeout(tick, 2000);
         return;
       }
 
@@ -257,8 +278,21 @@
     try {
       const info = await fetchInfo(url);
 
-      els.thumb.src = info.thumbnail || "";
-      els.thumb.alt = info.title ? `Thumbnail for ${info.title}` : "";
+      els.thumb.onerror = () => {
+        // No thumbnail available: hide the box instead of a broken-image icon.
+        els.mediaPanel.classList.add("no-thumb");
+        els.thumb.removeAttribute("src");
+      };
+      els.thumb.onload = () => {
+        els.mediaPanel.classList.remove("no-thumb");
+      };
+      if (info.thumbnail) {
+        els.thumb.src = info.thumbnail;
+        els.thumb.alt = `Thumbnail for ${info.title}`;
+      } else {
+        els.thumb.onerror();
+        els.thumb.alt = "";
+      }
       els.title.textContent = info.title || "Untitled";
       els.uploader.textContent = info.uploader || "";
       const durationText = formatDuration(info.duration);
