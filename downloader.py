@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
+import socket
+import threading
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -39,6 +42,145 @@ class UnsupportedURLError(Exception):
     """Raised when yt-dlp cannot extract or download a URL."""
 
 
+# Hard cap on download size (bytes). 0 disables the cap. This is enforced two
+# ways: yt-dlp's own max_filesize option, and filtering oversized formats out
+# of /api/info so users aren't offered qualities they cannot download.
+MAX_FILESIZE_BYTES = int(os.getenv("MAX_FILESIZE_BYTES", str(2 * 1024 * 1024 * 1024)))
+
+
+def _is_oversized(fmt: dict) -> bool:
+    """True if this format's size is known and exceeds the configured cap."""
+    if MAX_FILESIZE_BYTES <= 0:
+        return False
+    filesize = fmt.get("filesize") or fmt.get("filesize_approx")
+    return bool(filesize) and filesize > MAX_FILESIZE_BYTES
+
+
+# --------------------------------------------------------------------------
+# SSRF guard at the socket layer
+#
+# Validating a URL's DNS before handing it to yt-dlp cannot stop DNS
+# rebinding: the attacker simply returns a public IP for the first resolution
+# and a private one for yt-dlp's later resolutions. Instead, we patch
+# socket.create_connection so every *actual* connection is resolved-and-
+# checked as one atomic step, then connected by validated IP.
+#
+# Exemptions are limited to server-configured peers (never attacker
+# controlled): the bgutil PO-token provider (local loopback or a private
+# service name like http://bgutil-provider:4416) and the configured Facebook
+# proxy. Everything a user submits goes through the strict path.
+# --------------------------------------------------------------------------
+
+class BlockedAddressError(RuntimeError):
+    """A connection target resolved to a disallowed address."""
+
+
+_ssrf_guard_lock = threading.Lock()
+_ssrf_guard_installed = False
+
+
+def _assert_routable(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
+    if (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    ):
+        raise BlockedAddressError("Private or local network addresses are not supported.")
+
+
+def _resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    infos = socket.getaddrinfo(host, None)
+    resolved: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for family, _socktype, _proto, _canonname, sockaddr in infos:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        ip = ipaddress.ip_address(sockaddr[0])
+        if ip not in resolved:
+            resolved.append(ip)
+    return resolved
+
+
+def _socket_connect(
+    address: tuple,
+    timeout,
+    source_address=None,
+):
+    host, port, *extra = address
+    try:
+        family = ipaddress.ip_address(host).version
+    except ValueError:
+        family = 0
+    sock = socket.socket(
+        socket.AF_INET6 if family == 6 else socket.AF_INET if family == 4 else socket.AF_UNSPEC,
+        socket.SOCK_STREAM,
+    )
+    try:
+        if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+            sock.settimeout(timeout)
+        if source_address:
+            sock.bind(source_address)
+        sock.connect(address)
+        return sock
+    except OSError:
+        sock.close()
+        raise
+
+
+def _connect_protected(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+    host = str(address[0])
+
+    # 1) Server-configured peers (incl. all loopback names) pass through.
+    if host.lower().rstrip(".") in _config_exempt_hosts():
+        return socket.create_original_connection(address, timeout, source_address)
+
+    # 2) IP literals: validate directly — no DNS involved. Loopback literals
+    #    are covered by the config exemption above.
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if not literal_ip.is_loopback:
+            _assert_routable(literal_ip)
+        return socket.create_original_connection(address, timeout, source_address)
+
+    # 3) Hostnames: atomic resolve-validate-connect per address. Connecting
+    #    to the validated IP (not re-resolving inside the OS) closes the
+    #    DNS-rebinding race.
+    resolved = _resolve_host(host)
+    last_err: OSError | None = None
+    for ip in resolved:
+        _assert_routable(ip)
+        try:
+            return _socket_connect((str(ip), *address[1:]), timeout, source_address)
+        except OSError as exc:
+            last_err = exc
+    raise last_err if last_err else OSError(f"Could not resolve {host!r}")
+
+
+def _install_ssrf_guard() -> None:
+    """Patch socket.create_connection once (thread-safe, idempotent)."""
+    global _ssrf_guard_installed
+    with _ssrf_guard_lock:
+        if _ssrf_guard_installed:
+            return
+        if not hasattr(socket, "create_original_connection"):
+            socket.create_original_connection = socket.create_connection
+
+        def guarded_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                                      source_address=None):
+            try:
+                return _connect_protected(address, timeout, source_address)
+            except BlockedAddressError as err:
+                raise yt_dlp.utils.DownloadError(str(err)) from err
+
+        socket.create_connection = guarded_create_connection
+        _ssrf_guard_installed = True
+
+
 # Secrets/configuration are supplied by the deployment environment.
 FACEBOOK_PROXY_URL = os.getenv("FACEBOOK_PROXY_URL", "").strip()
 YTDLP_POT_PROVIDER_URL = os.getenv("YTDLP_POT_PROVIDER_URL", "").strip()
@@ -52,6 +194,30 @@ YTDLP_VERBOSE = os.getenv("YTDLP_VERBOSE", "false").lower() in {"true", "1", "ye
 
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be"}
 _FACEBOOK_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "fb.watch", "www.fb.watch"}
+
+
+# Loopback peers are always exempt: the bgutil provider runs on 127.0.0.1 in
+# the supported Docker deployment (and the plugin may use that default even
+# when YTDLP_POT_PROVIDER_URL is unset). User-submitted loopback/private URLs
+# are rejected in main.py before yt-dlp ever sees them, so this exemption
+# cannot be reached through the API — only by server-side config peers.
+_LOOPBACK_HOSTS = {"localhost", "localhost.localdomain"}
+
+
+def _config_exempt_hosts() -> set[str]:
+    """Hostnames the app is *designed* to reach, from server config only.
+
+    Read from module globals each call so tests can adjust config freely.
+    These never come from user-submitted URLs, so exempting them does not
+    create a user-facing SSRF path.
+    """
+    hosts = set(_LOOPBACK_HOSTS)
+    for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL):
+        if url:
+            host = (urlparse(url).hostname or "").lower().rstrip(".")
+            if host:
+                hosts.add(host)
+    return hosts
 
 
 def _host(url: str) -> str:
@@ -83,17 +249,17 @@ def _find_downloaded_file(output_dir: str, job_id: str, info: dict | None = None
                     return prepared_path
         except Exception:
             pass
-    
+
     # Fallback: directory scan with preference for base name match
     candidates = []
     expected_base = job_id + "."
     for fname in os.listdir(output_dir):
         if fname.startswith(expected_base) and not fname.endswith(".part"):
             candidates.append(os.path.join(output_dir, fname))
-    
+
     if not candidates:
         return None
-    
+
     # Prefer exact matches over mtime heuristic
     return max(candidates, key=os.path.getmtime)
 
@@ -227,6 +393,7 @@ def _extract_info_with_youtube_fallback(url: str, base_opts: dict, download: boo
     assert last_error is not None
     raise last_error
 
+
 def _base_options() -> dict:
     opts = {
         "quiet": True,
@@ -240,13 +407,17 @@ def _base_options() -> dict:
         "http_headers": {"User-Agent": YTDLP_USER_AGENT},
         "logger": logger,
     }
-    
+
+    if MAX_FILESIZE_BYTES > 0:
+        # Abort at yt-dlp level if the file is larger than the configured cap.
+        opts["max_filesize"] = MAX_FILESIZE_BYTES
+
     # Log diagnostic info about PO-token provider availability at startup
     if YTDLP_POT_PROVIDER_URL:
         diagnostic_logger.debug(
             f"[PO-TOKEN] Base options prepared with bgutil provider: {YTDLP_POT_PROVIDER_URL}"
         )
-    
+
     return opts
 
 
@@ -262,6 +433,16 @@ def _friendly_error(error: Exception) -> str:
     text = str(error)
     lower = text.lower()
 
+    if "larger than max-filesize" in lower or "max-filesize" in lower or "max_filesize" in lower:
+        limit_gb = MAX_FILESIZE_BYTES / (1024 * 1024 * 1024)
+        return (
+            f"This file is larger than the server's size limit "
+            f"({limit_gb:.1f} GB). Try a lower quality."
+        )
+
+    if "private or local network addresses are not supported" in lower:
+        return "That URL points at a private or local network address and is not allowed."
+
     if "sign in to confirm you're not a bot" in lower or "confirm you're not a bot" in lower:
         # Log diagnostic info about the failure
         if YTDLP_POT_PROVIDER_URL:
@@ -273,7 +454,7 @@ def _friendly_error(error: Exception) -> str:
             diagnostic_logger.error(
                 "[PO-TOKEN] LOGIN_REQUIRED and no bgutil provider configured."
             )
-        
+
         if YTDLP_POT_PROVIDER_URL and YOUTUBE_COOKIES_FILE:
             return (
                 "YouTube rejected the server session as automated. The configured PO-token "
@@ -307,6 +488,7 @@ def _friendly_error(error: Exception) -> str:
 
 def fetch_info(url: str) -> dict:
     """Extract metadata and normalized media formats without downloading."""
+    _install_ssrf_guard()
     ydl_opts = _base_options()
     ydl_opts.update({"skip_download": True})
 
@@ -346,6 +528,10 @@ def fetch_info(url: str) -> dict:
         if key in seen:
             continue
         seen.add(key)
+
+        # Don't offer qualities the server refuses to download.
+        if _is_oversized(f):
+            continue
 
         formats.append({
             "format_id": fmt_id,
@@ -387,6 +573,7 @@ def download_media(
     progress_callback: Callable[[dict], None] | None = None,
 ) -> tuple[str, str]:
     """Download media. Returns (filepath_on_disk, display_filename)."""
+    _install_ssrf_guard()
     os.makedirs(output_dir, exist_ok=True)
     outtmpl = os.path.join(output_dir, f"{job_id}.%(ext)s")
 

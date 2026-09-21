@@ -119,6 +119,10 @@ body {
 
 /* ---------- panels ---------- */
 
+/* Elements we toggle via [hidden] must actually hide even though some rules
+   set display on the same elements. */
+[hidden] { display: none !important; }
+
 .panel {
   background: var(--surface);
   border: 1px solid var(--border-soft);
@@ -243,6 +247,10 @@ body {
   border: 1px solid var(--border-soft);
   flex-shrink: 0;
 }
+
+/* When no thumbnail is available, hide the empty box and let text breathe. */
+.media-panel.no-thumb .media-thumb { display: none; }
+.media-panel.no-thumb .media-meta { flex: 1; }
 
 .media-meta { min-width: 0; }
 

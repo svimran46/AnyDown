@@ -25,4 +25,8 @@ if [ "$PROVIDER_READY" -ne 1 ]; then
   exit 1
 fi
 
-exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-10000}"
+# Trust the proxy's X-Forwarded-For so request.client.host is the real client
+# IP (required for per-IP throttling behind Render's router). Overridable via
+# FORWARDED_ALLOW_IPS if you front this with a stricter proxy setup.
+exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-10000}" \
+  --proxy-headers --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-*}"
