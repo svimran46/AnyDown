@@ -274,8 +274,9 @@ def _youtube_options(ydl_opts: dict, client: str | None = None) -> None:
     """
     extractor_args = ydl_opts.setdefault("extractor_args", {})
 
-    selected_client = client or os.getenv("YOUTUBE_PRIMARY_CLIENT", "mweb").strip() or "mweb"
-    diagnostic_logger.info("[YOUTUBE] Using player client: %s", selected_client)
+    selected_client = client if client else os.getenv("YOUTUBE_PRIMARY_CLIENT", "").strip()
+    if selected_client:
+        diagnostic_logger.info("[YOUTUBE] Using player client: %s", selected_client)
 
     if YTDLP_POT_PROVIDER_URL:
         diagnostic_logger.info(
@@ -286,14 +287,10 @@ def _youtube_options(ydl_opts: dict, client: str | None = None) -> None:
             "base_url": [YTDLP_POT_PROVIDER_URL]
         }
 
-    extractor_args["youtube"] = {
-        "player_client": [selected_client]
-    }
-
-    if YTDLP_POT_PROVIDER_URL and selected_client == "mweb":
-        diagnostic_logger.info(
-            "[PO-TOKEN] mweb selected; bgutil will supply PO tokens when requested"
-        )
+    if selected_client:
+        extractor_args["youtube"] = {
+            "player_client": [selected_client]
+        }
 
     # Cookies are optional and MUST be supplied as a server-side secret file.
     if YOUTUBE_COOKIES_FILE:
@@ -305,11 +302,14 @@ def _youtube_options(ydl_opts: dict, client: str | None = None) -> None:
                 f"{YOUTUBE_COOKIES_FILE}"
             )
 
-    # yt-dlp's current YouTube support uses EJS + a JS runtime.
-    ydl_opts.setdefault("remote_components", ["ejs:github"])
-    ydl_opts.setdefault(
-        "js_runtimes", {os.getenv("YTDLP_JS_RUNTIME", "node"): {}}
-    )
+    # yt-dlp's current YouTube support uses EJS + a JS runtime. Deno is the
+    # only runtime enabled by default; others must be explicitly enabled.
+    if "js_runtimes" not in ydl_opts:
+        runtime = os.getenv("YTDLP_JS_RUNTIME", "").strip()
+        if runtime:
+            ydl_opts["js_runtimes"] = {runtime: {}}
+        else:
+            ydl_opts["remote_components"] = ["ejs:github"]
 
 
 def _is_youtube_retryable_error(error: Exception) -> bool:
@@ -329,14 +329,25 @@ def _is_youtube_retryable_error(error: Exception) -> bool:
 
 
 def _youtube_clients() -> list[str]:
-    """Return a small, configurable client fallback chain."""
-    raw = os.getenv("YOUTUBE_CLIENTS", "mweb,tv,web_embedded")
+    """Return a configurable YouTube player-client fallback chain.
+
+    Client viability changes with every yt-dlp release (see the "Sign in to
+    confirm you're not a bot" era): hard-coding a stale chain makes the app
+    fail even when yt-dlp's own defaults would work. The default here is the
+    empty client, which defers entirely to yt-dlp's own currently-supported
+    client selection. YOUTUBE_CLIENTS forces specific clients (e.g.
+    "mweb,tv") and yt-dlp's defaults are always kept as the last resort.
+    """
+    raw = os.getenv("YOUTUBE_CLIENTS", "").strip()
     clients = []
     for item in raw.split(","):
         client = item.strip()
         if client and client not in clients:
             clients.append(client)
-    return clients or ["mweb", "tv", "web_embedded"]
+    if not clients or "" not in clients:
+        # "" = let yt-dlp pick its own defaults. Always the final attempt.
+        clients.append("")
+    return clients
 
 
 def _extract_info_with_youtube_fallback(url: str, base_opts: dict, download: bool = False):
