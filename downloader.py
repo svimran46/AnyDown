@@ -6,8 +6,10 @@ import ipaddress
 import logging
 import os
 import re
+import shutil
 import socket
 import threading
+import urllib.request
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -234,6 +236,62 @@ def is_facebook(url: str) -> bool:
     return host in _FACEBOOK_HOSTS or host.endswith(".facebook.com")
 
 
+# --------------------------------------------------------------------------
+# YouTube diagnostics helpers
+#
+# These report what the YouTube path will *actually* do at request time
+# (cookies file present and parseable? POT provider reachable? JS runtime
+# available?) so /api/health and user-facing errors reflect reality instead
+# of echoing environment variables.
+# --------------------------------------------------------------------------
+
+
+def youtube_cookies_status() -> dict:
+    """Inspect the configured cookies file without exposing its contents."""
+    if not YOUTUBE_COOKIES_FILE:
+        return {"configured": False, "file_found": None, "format": None}
+    found = os.path.isfile(YOUTUBE_COOKIES_FILE)
+    fmt: str | None = None
+    if found:
+        try:
+            with open(YOUTUBE_COOKIES_FILE, encoding="utf-8", errors="replace") as fh:
+                first_line = fh.readline(512).lstrip()
+            # Browser JSON exports start with '{' or '['; Netscape files start
+            # with '# Netscape ...' (or are empty).
+            fmt = "json" if first_line[:1] in ("{", "[") else "netscape"
+        except OSError:
+            fmt = None
+    return {"configured": True, "file_found": found, "format": fmt}
+
+
+def pot_provider_status(timeout: float = 2.0) -> dict:
+    """Ping the configured bgutil provider to see if it is actually running."""
+    if not YTDLP_POT_PROVIDER_URL:
+        return {"configured": False, "reachable": None}
+    ping_url = YTDLP_POT_PROVIDER_URL.rstrip("/") + "/ping"
+    try:
+        with urllib.request.urlopen(ping_url, timeout=timeout) as resp:
+            reachable = 200 <= resp.status < 300
+    except Exception:
+        reachable = False
+    return {"configured": True, "reachable": reachable}
+
+
+_js_runtime_cache: dict[str, str] = {}
+
+
+def detect_js_runtime() -> str:
+    """Find a JS runtime yt-dlp's EJS support can use; "" when none exists."""
+    if "runtime" not in _js_runtime_cache:
+        found = ""
+        for name in ("node", "deno", "bun", "quickjs"):
+            if shutil.which(name):
+                found = name
+                break
+        _js_runtime_cache["runtime"] = found
+    return _js_runtime_cache["runtime"]
+
+
 def _sanitize_filename(name: str) -> str:
     name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "_", name).strip()
     return name[:150] if name else "download"
@@ -265,50 +323,65 @@ def _find_downloaded_file(output_dir: str, job_id: str, info: dict | None = None
 
 
 def _youtube_options(ydl_opts: dict, client: str | None = None) -> None:
-    """Configure yt-dlp's current YouTube helpers.
+    """Configure yt-dlp's current YouTube helpers for one attempt.
 
     bgutil is installed as the official yt-dlp plugin.  The HTTP provider is
     only needed for clients that use PO tokens (notably mweb).  Keep the
     provider available, but don't force mweb for every YouTube request: yt-dlp
     documents several clients with different requirements and limitations.
+
+    `client` is the explicit player client for THIS attempt ("" or None
+    defers to yt-dlp's own selection). Client ordering/pinning lives in
+    _youtube_clients(); this function never re-reads YOUTUBE_PRIMARY_CLIENT,
+    so the final defaults attempt stays genuinely unpinned.
     """
     extractor_args = ydl_opts.setdefault("extractor_args", {})
 
-    selected_client = client if client else os.getenv("YOUTUBE_PRIMARY_CLIENT", "").strip()
-    if selected_client:
-        diagnostic_logger.info("[YOUTUBE] Using player client: %s", selected_client)
+    if client:
+        diagnostic_logger.info("[YOUTUBE] Using player client: %s", client)
+        extractor_args["youtube"] = {"player_client": [client]}
 
     if YTDLP_POT_PROVIDER_URL:
-        diagnostic_logger.info(
-            "[PO-TOKEN] bgutil POT provider configured: %s",
-            YTDLP_POT_PROVIDER_URL,
-        )
         extractor_args["youtubepot-bgutilhttp"] = {
             "base_url": [YTDLP_POT_PROVIDER_URL]
         }
 
-    if selected_client:
-        extractor_args["youtube"] = {
-            "player_client": [selected_client]
-        }
-
     # Cookies are optional and MUST be supplied as a server-side secret file.
-    if YOUTUBE_COOKIES_FILE:
-        if os.path.isfile(YOUTUBE_COOKIES_FILE):
-            ydl_opts["cookiefile"] = YOUTUBE_COOKIES_FILE
-        else:
-            raise UnsupportedURLError(
-                f"YOUTUBE_COOKIES_FILE is configured but the file does not exist: "
-                f"{YOUTUBE_COOKIES_FILE}"
+    cookies = youtube_cookies_status()
+    if cookies["configured"]:
+        if not cookies["file_found"]:
+            # A stale/mis-mounted secret path must not take down every
+            # YouTube request: continue without cookies and say so loudly.
+            diagnostic_logger.warning(
+                "[COOKIES] YOUTUBE_COOKIES_FILE is configured but the file does "
+                "not exist: %s. Continuing without cookies; fix the path or "
+                "unset the variable.",
+                YOUTUBE_COOKIES_FILE,
             )
+        elif cookies["format"] == "json":
+            # A JSON cookie export can never work; fail with the fix instead
+            # of letting yt-dlp emit a cryptic formatting error.
+            raise UnsupportedURLError(
+                "YOUTUBE_COOKIES_FILE points at a JSON cookie export. yt-dlp "
+                "requires Netscape-format cookies.txt (re-export with a "
+                "'cookies.txt' browser extension, not the browser's JSON "
+                "cookies database)."
+            )
+        else:
+            ydl_opts["cookiefile"] = YOUTUBE_COOKIES_FILE
 
     # yt-dlp's current YouTube support uses EJS + a JS runtime. Deno is the
     # only runtime enabled by default; others must be explicitly enabled.
     if "js_runtimes" not in ydl_opts:
-        runtime = os.getenv("YTDLP_JS_RUNTIME", "").strip()
+        runtime = os.getenv("YTDLP_JS_RUNTIME", "").strip() or detect_js_runtime()
         if runtime:
             ydl_opts["js_runtimes"] = {runtime: {}}
         else:
+            diagnostic_logger.warning(
+                "[YOUTUBE] No JavaScript runtime found (node/deno/bun/quickjs); "
+                "some YouTube formats may be missing. Deploy via the Dockerfile "
+                "or install a runtime."
+            )
             ydl_opts["remote_components"] = ["ejs:github"]
 
 
@@ -335,19 +408,30 @@ def _youtube_clients() -> list[str]:
     confirm you're not a bot" era): hard-coding a stale chain makes the app
     fail even when yt-dlp's own defaults would work. The default here is the
     empty client, which defers entirely to yt-dlp's own currently-supported
-    client selection. YOUTUBE_CLIENTS forces specific clients (e.g.
-    "mweb,tv") and yt-dlp's defaults are always kept as the last resort.
+    client selection.
+
+    YOUTUBE_PRIMARY_CLIENT puts one client first without dropping the rest;
+    YOUTUBE_CLIENTS forces a specific chain (e.g. "mweb,tv"). In both cases
+    the empty client — yt-dlp's own defaults — is always appended as the
+    final attempt, so a pinned primary can never remove the escape hatch.
     """
-    raw = os.getenv("YOUTUBE_CLIENTS", "").strip()
-    clients = []
-    for item in raw.split(","):
+    clients: list[str] = []
+    primary = os.getenv("YOUTUBE_PRIMARY_CLIENT", "").strip()
+    if primary:
+        clients.append(primary)
+    for item in os.getenv("YOUTUBE_CLIENTS", "").strip().split(","):
         client = item.strip()
         if client and client not in clients:
             clients.append(client)
-    if not clients or "" not in clients:
+    if "" not in clients:
         # "" = let yt-dlp pick its own defaults. Always the final attempt.
         clients.append("")
     return clients
+
+
+def _client_label(client: str) -> str:
+    """Human-readable name for a chain entry ("" = yt-dlp's own defaults)."""
+    return client if client else "yt-dlp-defaults"
 
 
 def _extract_info_with_youtube_fallback(url: str, base_opts: dict, download: bool = False):
@@ -376,20 +460,20 @@ def _extract_info_with_youtube_fallback(url: str, base_opts: dict, download: boo
             opts["format"] = "bestaudio/best" if has_audio_pp else "bestvideo+bestaudio/best"
             diagnostic_logger.info(
                 "[YOUTUBE] Fallback client=%s using client-neutral format selector",
-                client,
+                _client_label(client),
             )
 
         diagnostic_logger.info(
             "[YOUTUBE] Attempt %d/%d using client=%s",
             index + 1,
             len(clients),
-            client,
+            _client_label(client),
         )
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
             diagnostic_logger.info(
-                "[YOUTUBE] Success using client=%s", client
+                "[YOUTUBE] Success using client=%s", _client_label(client)
             )
             return info, client
         except yt_dlp.utils.DownloadError as exc:
@@ -455,34 +539,37 @@ def _friendly_error(error: Exception) -> str:
         return "That URL points at a private or local network address and is not allowed."
 
     if "sign in to confirm you're not a bot" in lower or "confirm you're not a bot" in lower:
-        # Log diagnostic info about the failure
-        if YTDLP_POT_PROVIDER_URL:
-            diagnostic_logger.error(
-                "[PO-TOKEN] mweb extraction failed with LOGIN_REQUIRED despite bgutil provider. "
-                "Check: bgutil connectivity, token acquisition, and video/session restrictions."
+        # Report the actual server state instead of blaming cookies by default.
+        cookies = youtube_cookies_status()
+        pot = pot_provider_status()
+        state = []
+        if pot["configured"]:
+            state.append(
+                "bgutil PO-token provider is configured"
+                + (" and reachable" if pot["reachable"] else " but is NOT reachable")
             )
         else:
-            diagnostic_logger.error(
-                "[PO-TOKEN] LOGIN_REQUIRED and no bgutil provider configured."
+            state.append("no PO-token provider is configured (YTDLP_POT_PROVIDER_URL)")
+        if not cookies["configured"]:
+            state.append("no YouTube cookies are configured (YOUTUBE_COOKIES_FILE)")
+        elif not cookies["file_found"]:
+            state.append(f"the configured cookies file is missing: {YOUTUBE_COOKIES_FILE}")
+        elif cookies["format"] == "json":
+            state.append("the configured cookies file is a JSON export, which yt-dlp cannot use")
+        else:
+            state.append(
+                "a cookies file is configured (expired cookies are silently "
+                "ignored by yt-dlp — re-export if they are old)"
             )
-
-        if YTDLP_POT_PROVIDER_URL and YOUTUBE_COOKIES_FILE:
-            return (
-                "YouTube rejected the server session as automated. The configured PO-token "
-                "provider and cookie session were both supplied, so this is likely an "
-                "IP/session block. Try again later or use a different server/IP."
-            )
-        if not YTDLP_POT_PROVIDER_URL:
-            return (
-                "YouTube rejected this server as automated. Configure a reachable bgutil "
-                "PO-token provider with YTDLP_POT_PROVIDER_URL. If the video still requires "
-                "authentication, use a server-side YouTube cookies secret file; never paste "
-                "cookies into the website."
-            )
+        diagnostic_logger.error(
+            "[YOUTUBE] Bot check failed on every client attempt. Server state: %s",
+            "; ".join(state),
+        )
         return (
-            "YouTube rejected the available server-side clients for this request. "
-            "AnyDown tried its configured YouTube client fallbacks, but YouTube still "
-            "requires authentication or is blocking this server/IP."
+            "YouTube flagged this server's traffic as automated. Switching clients "
+            "and PO tokens often cannot clear this on datacenter IPs; an "
+            "authenticated YouTube cookies file (or a cleaner server IP) usually "
+            "can. Server state: " + "; ".join(state) + "."
         )
 
     if "sign in to confirm your age" in lower or "age-restricted" in lower:
