@@ -19,8 +19,11 @@ import yt_dlp
 from downloader import (
     MAX_FILESIZE_BYTES,
     download_media,
+    detect_js_runtime,
     fetch_info,
+    pot_provider_status,
     UnsupportedURLError,
+    youtube_cookies_status,
 )
 from job_manager import JobStatus, job_manager
 
@@ -184,11 +187,17 @@ def _job_payload(job):
 
 @app.get("/api/health")
 def health():
+    cookies = youtube_cookies_status()
+    pot = pot_provider_status()
+    js_runtime = os.getenv("YTDLP_JS_RUNTIME", "").strip() or detect_js_runtime()
     return {
         "status": "ok",
         "yt_dlp": yt_dlp.version.__version__,
-        "pot_provider_configured": bool(os.getenv("YTDLP_POT_PROVIDER_URL", "").strip()),
-        "youtube_cookies_configured": bool(os.getenv("YOUTUBE_COOKIES_FILE", "").strip()),
+        "youtube_cookies": cookies,
+        "youtube_cookies_configured": cookies["configured"],
+        "pot_provider_configured": pot["configured"],
+        "pot_provider_reachable": pot["reachable"],
+        "js_runtime": js_runtime or None,
         "max_concurrent_downloads": MAX_CONCURRENT_DOWNLOADS,
         "max_filesize_bytes": MAX_FILESIZE_BYTES,
     }
