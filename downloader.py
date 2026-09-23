@@ -197,6 +197,10 @@ YTDLP_VERBOSE = os.getenv("YTDLP_VERBOSE", "false").lower() in {"true", "1", "ye
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be"}
 _FACEBOOK_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "fb.watch", "www.fb.watch"}
 
+# Default YouTube player-client fallback chain, tuned for datacenter IPs
+# where YouTube's bot checks are most aggressive. See _youtube_clients().
+DEFAULT_YOUTUBE_CLIENTS = ("mweb", "tv", "")
+
 
 # Loopback peers are always exempt: the bgutil provider runs on 127.0.0.1 in
 # the supported Docker deployment (and the plugin may use that default even
@@ -406,14 +410,27 @@ def _youtube_clients() -> list[str]:
 
     Client viability changes with every yt-dlp release (see the "Sign in to
     confirm you're not a bot" era): hard-coding a stale chain makes the app
-    fail even when yt-dlp's own defaults would work. The default here is the
-    empty client, which defers entirely to yt-dlp's own currently-supported
-    client selection.
+    fail even when yt-dlp's own defaults would work.
+
+    The default chain is tuned for datacenter IPs (Render et al.), where
+    YouTube most aggressively flags automated traffic:
+
+    1. "mweb" — yt-dlp's officially recommended client when an IP is
+       flagged. It requires a GVS PO token, which the bgutil provider
+       supplies (verified working end-to-end on a datacenter IP).
+    2. "tv" — needs no PO token and is usually not bot-checked, at the
+       cost of some DRM-protected formats without cookies.
+    3. "" — defer to yt-dlp's own currently-supported client selection
+       (visionos + web as of 2026.08). Kept as the final attempt so this
+       app tracks yt-dlp's future client changes without a code change;
+       it also handles cookies/authenticated defaults correctly.
 
     YOUTUBE_PRIMARY_CLIENT puts one client first without dropping the rest;
     YOUTUBE_CLIENTS forces a specific chain (e.g. "mweb,tv"). In both cases
-    the empty client — yt-dlp's own defaults — is always appended as the
-    final attempt, so a pinned primary can never remove the escape hatch.
+    the entries above are only used when those variables are unset, and a
+    forced chain always keeps the empty client — yt-dlp's own defaults —
+    as the final attempt, so a pinned primary can never remove the escape
+    hatch.
     """
     clients: list[str] = []
     primary = os.getenv("YOUTUBE_PRIMARY_CLIENT", "").strip()
@@ -423,6 +440,8 @@ def _youtube_clients() -> list[str]:
         client = item.strip()
         if client and client not in clients:
             clients.append(client)
+    if not clients:
+        clients = list(DEFAULT_YOUTUBE_CLIENTS)
     if "" not in clients:
         # "" = let yt-dlp pick its own defaults. Always the final attempt.
         clients.append("")
