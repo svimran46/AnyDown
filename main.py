@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 import yt_dlp
 from downloader import (
+    APP_VERSION,
     MAX_FILESIZE_BYTES,
     download_media,
     detect_js_runtime,
@@ -192,6 +193,7 @@ def health():
     js_runtime = os.getenv("YTDLP_JS_RUNTIME", "").strip() or detect_js_runtime()
     return {
         "status": "ok",
+        "app_version": APP_VERSION,
         "yt_dlp": yt_dlp.version.__version__,
         "youtube_cookies": cookies,
         "youtube_cookies_configured": cookies["configured"],

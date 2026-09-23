@@ -201,6 +201,13 @@ _FACEBOOK_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "fb.wat
 # where YouTube's bot checks are most aggressive. See _youtube_clients().
 DEFAULT_YOUTUBE_CLIENTS = ("mweb", "tv", "")
 
+# App version, surfaced in /api/health and in YouTube error messages so a
+# deployment running stale code is identifiable at a glance: if the version
+# reported there does not match the latest commit on main, the service is
+# running an older image and must be redeployed (Render: "Clear build cache
+# & deploy" — Docker layer caching can otherwise serve a stale image).
+APP_VERSION = "2.1.0"
+
 
 # Loopback peers are always exempt: the bgutil provider runs on 127.0.0.1 in
 # the supported Docker deployment (and the plugin may use that default even
@@ -585,10 +592,10 @@ def _friendly_error(error: Exception) -> str:
             "; ".join(state),
         )
         return (
-            "YouTube flagged this server's traffic as automated. Switching clients "
-            "and PO tokens often cannot clear this on datacenter IPs; an "
-            "authenticated YouTube cookies file (or a cleaner server IP) usually "
-            "can. Server state: " + "; ".join(state) + "."
+            f"[AnyDown {APP_VERSION}] YouTube flagged this server's traffic as "
+            "automated. Switching clients and PO tokens often cannot clear this "
+            "on datacenter IPs; an authenticated YouTube cookies file (or a "
+            "cleaner server IP) usually can. Server state: " + "; ".join(state) + "."
         )
 
     if "sign in to confirm your age" in lower or "age-restricted" in lower:
