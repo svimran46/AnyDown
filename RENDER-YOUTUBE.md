@@ -48,6 +48,23 @@ The container starts:
 
 Do not expose port 4416 publicly.
 
+### Verify the deploy is fresh (do this first)
+
+YouTube fixes only help once they are actually running. Every release of this
+app carries a version marker (`APP_VERSION` in `downloader.py`) that shows up
+in two places:
+
+- `GET /api/health` → `"app_version": "2.1.0"`
+- Every bot-check error message → prefixed with `[AnyDown 2.1.0]`
+
+If you ever see a raw yt-dlp message such as `ERROR: [youtube] ... Use
+--cookies-from-browser ...` **without** the `[AnyDown x.y.z]` prefix, the
+service is running pre-fix code and no configuration change will help.
+
+To force a fresh image after merging a fix, use Render's **"Manual Deploy →
+Clear build cache & deploy"**. Docker layer caching can otherwise keep serving
+an old image even after a normal deploy.
+
 ## Optional YouTube cookies
 
 If YouTube still requires authentication for particular videos, export a server-side cookies.txt for an account/content you are authorized to access and upload it in Render under **Environment → Secret Files** as `youtube_cookies.txt`.
@@ -64,15 +81,19 @@ PO tokens are not a universal bypass: YouTube can still reject an IP/session, an
 
 YouTube extraction breaks regularly as YouTube and yt-dlp evolve. When it does:
 
-1. Set `YTDLP_VERBOSE=true` and check the server logs for which client was
+1. Verify the deployed version first (see above): `/api/health` must show the
+   latest `app_version` and errors must carry the `[AnyDown x.y.z]` prefix. A
+   raw yt-dlp error means the service is running stale code — redeploy with
+   cleared build cache before touching anything else.
+2. Set `YTDLP_VERBOSE=true` and check the server logs for which client was
    used (each fallback attempt is logged with its client name).
-2. Update yt-dlp first (`pip install -U yt-dlp`) — new releases usually fix new
+3. Update yt-dlp first (`pip install -U yt-dlp`) — new releases usually fix new
    blocks within days.
-3. Check `/api/health`: `yt_dlp` shows the running version,
+4. Check `/api/health`: `yt_dlp` shows the running version,
    `pot_provider_reachable` must be true for the mweb attempt to help, and
    `js_runtime` must be non-null (the Dockerfile provides Node).
-4. Only then pin clients via `YOUTUBE_CLIENTS`, and remove the pin once fixed
+5. Only then pin clients via `YOUTUBE_CLIENTS`, and remove the pin once fixed
    upstream.
-5. If every attempt still fails with the bot check on a datacenter IP, add an
+6. If every attempt still fails with the bot check on a datacenter IP, add an
    authenticated YouTube cookies file (see above) — cookies clear IP-level
    flagging that PO tokens cannot.

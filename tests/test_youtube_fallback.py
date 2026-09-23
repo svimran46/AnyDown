@@ -139,6 +139,28 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("/nonexistent/cookies.txt", msg)
 
 
+class VersionMarkerTests(unittest.TestCase):
+    """The app version must be visible in health output and bot-check errors
+    so a stale deployment is identifiable from the error text alone."""
+
+    def test_app_version_is_nonempty_semverish(self):
+        self.assertRegex(downloader.APP_VERSION, r"^\d+\.\d+\.\d+$")
+
+    def test_bot_check_error_includes_app_version(self):
+        msg = downloader._friendly_error(
+            downloader.UnsupportedURLError("confirm you're not a bot")
+        )
+        self.assertIn(f"[AnyDown {downloader.APP_VERSION}]", msg)
+
+    def test_health_payload_includes_app_version(self):
+        # health() is a plain sync function; calling it directly avoids the
+        # optional httpx2 dependency needed by fastapi's TestClient.
+        import main
+        payload = main.health()
+        self.assertEqual(payload["app_version"], downloader.APP_VERSION)
+        self.assertIn("yt_dlp", payload)
+
+
 class JsRuntimeTests(unittest.TestCase):
     def test_detect_returns_string(self):
         # In a bare environment "" is acceptable (warning + remote components);
