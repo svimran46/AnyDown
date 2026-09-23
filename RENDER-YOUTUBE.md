@@ -6,21 +6,36 @@ This version includes a Docker deployment that runs the bgutil provider and Fast
 
 ## YouTube player clients (important)
 
-AnyDown no longer forces a fixed list of YouTube player clients. Older versions
-hard-coded `mweb,tv,web_embedded`, and YouTube/yt-dlp changes made every client
-in that chain fail — which surfaced as "Sign in to confirm you're not a bot"
-even though yt-dlp's own defaults would have worked.
+Older versions hard-coded `mweb,tv,web_embedded`, and YouTube/yt-dlp changes
+made every client in that chain fail — which surfaced as "Sign in to confirm
+you're not a bot" even though yt-dlp's own defaults would have worked.
 
 The current behavior:
 
-- By default AnyDown defers to yt-dlp's own currently-supported client
-  selection, which tracks YouTube's changes with every yt-dlp release.
+- The default chain is tuned for datacenter IPs (Render et al.), where the
+  bot check bites hardest:
+
+  1. `mweb` — yt-dlp's recommended client when an IP is flagged. It needs a
+     GVS PO token, which the bundled bgutil provider supplies.
+  2. `tv` — needs no PO token and is usually not bot-checked.
+  3. yt-dlp's own currently-supported client selection, which tracks
+     YouTube's changes with every yt-dlp release (and handles
+     cookies/authenticated defaults correctly).
+
+  Each client is only tried when the previous one fails with a known
+  YouTube block (bot check, 403, 429, login required, ...).
+
 - `YOUTUBE_CLIENTS` optionally forces a chain (comma-separated), and
   yt-dlp's defaults are always tried last. Example: `YOUTUBE_CLIENTS=mweb,tv`.
 - `YOUTUBE_PRIMARY_CLIENT` optionally puts one client first without dropping
   the rest.
 - The bgutil PO-token provider stays configured; clients that need PO tokens
   (e.g. mweb) will use it when selected.
+
+Note the mweb attempt only works if the bgutil provider is actually running
+and reachable. `/api/health` reports `pot_provider_configured` and
+`pot_provider_reachable`; if the provider is down the chain still proceeds
+to `tv` and yt-dlp's defaults.
 
 ## Render
 
@@ -49,8 +64,15 @@ PO tokens are not a universal bypass: YouTube can still reject an IP/session, an
 
 YouTube extraction breaks regularly as YouTube and yt-dlp evolve. When it does:
 
-1. Set `YTDLP_VERBOSE=true` and check the server logs for which client was used.
+1. Set `YTDLP_VERBOSE=true` and check the server logs for which client was
+   used (each fallback attempt is logged with its client name).
 2. Update yt-dlp first (`pip install -U yt-dlp`) — new releases usually fix new
    blocks within days.
-3. Only then pin clients via `YOUTUBE_CLIENTS`, and remove the pin once fixed
+3. Check `/api/health`: `yt_dlp` shows the running version,
+   `pot_provider_reachable` must be true for the mweb attempt to help, and
+   `js_runtime` must be non-null (the Dockerfile provides Node).
+4. Only then pin clients via `YOUTUBE_CLIENTS`, and remove the pin once fixed
    upstream.
+5. If every attempt still fails with the bot check on a datacenter IP, add an
+   authenticated YouTube cookies file (see above) — cookies clear IP-level
+   flagging that PO tokens cannot.

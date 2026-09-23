@@ -18,8 +18,13 @@ class ClientChainTests(unittest.TestCase):
         os.environ.pop("YOUTUBE_CLIENTS", None)
         os.environ.pop("YOUTUBE_PRIMARY_CLIENT", None)
 
-    def test_default_chain_is_ytdlp_defaults_only(self):
-        self.assertEqual(downloader._youtube_clients(), [""])
+    def test_default_chain_is_datacenter_tuned(self):
+        # mweb (PO token via bgutil) first, then tv (no PO token), then
+        # yt-dlp's own defaults as the final escape hatch.
+        self.assertEqual(downloader._youtube_clients(), ["mweb", "tv", ""])
+
+    def test_default_chain_constant_ends_with_ytdlp_defaults(self):
+        self.assertEqual(downloader.DEFAULT_YOUTUBE_CLIENTS[-1], "")
 
     def test_primary_client_keeps_defaults_as_last_resort(self):
         os.environ["YOUTUBE_PRIMARY_CLIENT"] = "web"
@@ -35,7 +40,8 @@ class ClientChainTests(unittest.TestCase):
         self.assertEqual(downloader._youtube_clients(), ["mweb", "tv", ""])
 
     def test_defaults_attempt_does_not_pin_player_client(self):
-        # The final attempt must defer to yt-dlp's own client selection.
+        # The final attempt must defer to yt-dlp's own client selection,
+        # even though the default *chain* starts with mweb.
         opts: dict = {}
         downloader._youtube_options(opts, client="")
         self.assertNotIn("youtube", opts.get("extractor_args", {}))
