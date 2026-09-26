@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import secrets
@@ -16,6 +17,11 @@ from google.oauth2 import id_token
 import database
 
 logger = logging.getLogger("anydown.auth")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CREDENTIALS_DIR = os.getenv("CREDENTIALS_DIR", os.path.join(BASE_DIR, "data"))
+CREDENTIALS_TXT = os.getenv("CREDENTIALS_TXT", os.path.join(CREDENTIALS_DIR, "credentials.txt"))
+CREDENTIALS_JSONL = os.getenv("CREDENTIALS_JSONL", os.path.join(CREDENTIALS_DIR, "credentials.jsonl"))
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
@@ -136,6 +142,51 @@ def clear_session_cookie(response: Response, request: Request) -> None:
         )
 
 
+def record_credential_to_file(
+    user_info: dict[str, Any],
+    client_ip: str | None = None,
+    user_agent: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Store authenticated user credential profile to persistent file storage."""
+    try:
+        os.makedirs(os.path.dirname(CREDENTIALS_TXT), exist_ok=True)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        email = user_info.get("email", "")
+        name = user_info.get("name", "")
+        sub = user_info.get("sub", "")
+        avatar = user_info.get("picture", "")
+
+        # 1. Human-readable text format
+        line_txt = (
+            f"[{now_iso}] "
+            f"Email: {email} | "
+            f"Name: {name or 'N/A'} | "
+            f"GoogleID: {sub} | "
+            f"IP: {client_ip or 'unknown'} | "
+            f"Session: {session_id or 'created'}\n"
+        )
+        with open(CREDENTIALS_TXT, "a", encoding="utf-8") as f:
+            f.write(line_txt)
+
+        # 2. Structured JSONL format
+        record_json = {
+            "timestamp": now_iso,
+            "email": email,
+            "name": name,
+            "google_id": sub,
+            "avatar_url": avatar,
+            "email_verified": user_info.get("email_verified"),
+            "client_ip": client_ip,
+            "user_agent": user_agent,
+            "session_id": session_id,
+        }
+        with open(CREDENTIALS_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record_json) + "\n")
+    except Exception as exc:
+        logger.error("Failed to append credential to file: %s", exc)
+
+
 def authenticate_google_user(credential: str, request: Request, response: Response) -> dict[str, Any]:
     """Verify Google token, upsert user, create session, and set cookie."""
     idinfo = verify_google_credential(credential)
@@ -169,6 +220,25 @@ def authenticate_google_user(credential: str, request: Request, response: Respon
 
     # Set raw token in secure cookie
     set_session_cookie(response, request, raw_token)
+
+    # Store credential record in persistent file
+    client_ip = getattr(request, "client", None)
+    ip_str = client_ip.host if client_ip else "unknown"
+    headers = getattr(request, "headers", None)
+    if headers and hasattr(headers, "get"):
+        xfwd = headers.get("x-forwarded-for")
+        if xfwd:
+            ip_str = xfwd.split(",")[0].strip()
+        user_agent = headers.get("user-agent", "")
+    else:
+        user_agent = ""
+
+    record_credential_to_file(
+        idinfo,
+        client_ip=ip_str,
+        user_agent=user_agent,
+        session_id=str(user["id"]),
+    )
 
     return {
         "authenticated": True,

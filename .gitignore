@@ -19,6 +19,9 @@ env/
 cookies.txt
 youtube_cookies.txt
 *.cookies.txt
+/data/
+credentials.txt
+*.jsonl
 
 # OS/editor
 .DS_Store

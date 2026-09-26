@@ -40,6 +40,14 @@
     modalCloseBtn: $("modal-close-btn"),
     modalDesc: $("modal-desc"),
     gSigninElement: $("g-signin-element"),
+
+    statusTip: $("status-tip"),
+    statusTipText: $("status-tip-text"),
+
+    minimalAuthCard: $("minimal-auth-card"),
+    minimalAuthTag: $("minimal-auth-tag"),
+    minimalAuthTitle: $("minimal-auth-title"),
+    minimalGSigninElement: $("minimal-g-signin-element"),
   };
 
   const authState = {
@@ -55,6 +63,7 @@
     formats: [],
     selectedFormatId: null,
     selectedIsAudioOnly: false,
+    selectedIsLocked: false,
     pollHandle: null,
   };
 
@@ -159,20 +168,57 @@
     if (els.loginModal) els.loginModal.hidden = true;
   }
 
-  function renderGoogleButton() {
-    if (!window.google || !window.google.accounts || !window.google.accounts.id) return;
-    if (!els.gSigninElement) return;
+  function showMinimalAuthCard(fmt, labelText) {
+    if (!els.minimalAuthCard || authState.authenticated) return;
+    const res = fmt ? (fmt.resolution || (fmt.height ? `${fmt.height}p` : fmt.note || labelText || "HD")) : (labelText || "HD");
+    if (els.minimalAuthTag) els.minimalAuthTag.textContent = `Quality Gate: ${res}`;
+    if (els.minimalAuthTitle) els.minimalAuthTitle.textContent = `Sign in with Google to download in ${res}`;
+    els.minimalAuthCard.hidden = false;
+    renderGoogleButtons();
+  }
 
-    els.gSigninElement.innerHTML = "";
-    google.accounts.id.renderButton(els.gSigninElement, {
-      type: "standard",
-      theme: "filled_black",
-      size: "large",
-      text: "signin_with",
-      shape: "rectangular",
-      logo_alignment: "left",
-      width: 280,
-    });
+  function hideMinimalAuthCard() {
+    if (els.minimalAuthCard) {
+      els.minimalAuthCard.hidden = true;
+    }
+  }
+
+  function renderGoogleButtons() {
+    if (!window.google || !window.google.accounts || !window.google.accounts.id) return;
+
+    if (els.gSigninElement) {
+      els.gSigninElement.innerHTML = "";
+      try {
+        google.accounts.id.renderButton(els.gSigninElement, {
+          type: "standard",
+          theme: "filled_black",
+          size: "large",
+          text: "signin_with",
+          shape: "rectangular",
+          logo_alignment: "left",
+          width: 280,
+        });
+      } catch (e) {
+        console.warn("Could not render modal Google button", e);
+      }
+    }
+
+    if (els.minimalGSigninElement) {
+      els.minimalGSigninElement.innerHTML = "";
+      try {
+        google.accounts.id.renderButton(els.minimalGSigninElement, {
+          type: "standard",
+          theme: "filled_blue",
+          size: "large",
+          text: "signin_with",
+          shape: "rectangular",
+          logo_alignment: "left",
+          width: 260,
+        });
+      } catch (e) {
+        console.warn("Could not render inline Google button", e);
+      }
+    }
   }
 
   function setupGoogleIdentityServices() {
@@ -189,7 +235,7 @@
       cancel_on_tap_outside: true,
     });
     authState.gisInitialized = true;
-    renderGoogleButton();
+    renderGoogleButtons();
   }
 
   async function handleGoogleCredentialResponse(googleResponse) {
@@ -204,6 +250,7 @@
       const data = await parseResponse(res, "Sign in failed.");
       if (data.authenticated && data.user) {
         setAuthenticatedUser(data.user);
+        hideMinimalAuthCard();
         closeLoginModal();
 
         // Refresh ladder rungs to unlock qualities
@@ -211,7 +258,7 @@
           renderLadder(state.formats);
         }
 
-        // Phase 10: Automatic resume of requested download!
+        // Automatic resume of requested download
         if (authState.pendingDownload) {
           const pending = authState.pendingDownload;
           authState.pendingDownload = null;
@@ -343,17 +390,22 @@
       rung.append(label, rightContainer);
 
       rung.addEventListener("click", () => {
+        selectRung(rung);
+
         if (rung.dataset.locked === "true") {
-          // Unauthenticated user clicked locked format: prompt Google login and record pending download
+          // Unauthenticated user clicked locked format (>720p):
+          // 1. Record pending download
           authState.pendingDownload = {
             url: els.urlInput.value.trim(),
             formatId: fmt.format_id,
             isAudioOnly: fmt.format_id === "audio-only",
           };
-          openLoginModal(`Sign in with Google to download ${fmt.resolution || textLabel}.`);
-          return;
+          // 2. Open the minimalistic sign-in box directly under the ladder!
+          showMinimalAuthCard(fmt, textLabel);
+        } else {
+          // Unlocked format (<= 720p or audio): hide minimal auth box
+          hideMinimalAuthCard();
         }
-        selectRung(rung);
       });
 
       rung.addEventListener("keydown", (e) => handleRungKeydown(e, rung));
@@ -373,7 +425,15 @@
 
     state.selectedFormatId = rung.dataset.formatId;
     state.selectedIsAudioOnly = rung.dataset.audioOnly === "true";
+    state.selectedIsLocked = rung.dataset.locked === "true";
     els.downloadBtn.disabled = false;
+
+    const labelSpan = els.downloadBtn.querySelector(".btn-label");
+    if (labelSpan) {
+      labelSpan.textContent = (state.selectedIsLocked && !authState.authenticated)
+        ? "Sign in with Google to Download"
+        : "Download";
+    }
   }
 
   function handleRungKeydown(e, rung) {
@@ -392,28 +452,177 @@
     }
   }
 
+  // ---------- error explanation & guidance ----------
+
+  function explainError(rawError, context = "download") {
+    let msg = "";
+    let tip = "";
+
+    if (typeof rawError === "string") {
+      msg = rawError;
+    } else if (rawError && rawError.message) {
+      msg = rawError.message;
+      if (rawError.tip) tip = rawError.tip;
+    } else {
+      msg = "An unexpected error occurred.";
+    }
+
+    const lower = msg.toLowerCase();
+
+    // 1. Rate Limiting (429)
+    if (lower.includes("too many requests") || rawError?.status === 429 || lower.includes("rate limit") || lower.includes("slow down")) {
+      return {
+        message: msg.includes("wait") ? msg : "Too many requests in a short period.",
+        tip: tip || "Please wait 5 seconds before making another request to protect the server."
+      };
+    }
+
+    // 2. Quality Gate / Login Required (401)
+    if (rawError?.code === "LOGIN_REQUIRED" || lower.includes("sign in with google") || rawError?.status === 401) {
+      return {
+        message: msg,
+        tip: tip || "Sign in with your Google account to unlock 1080p, 1440p, and 4K downloads instantly."
+      };
+    }
+
+    // 3. Format / Audio / Video stream missing
+    if (lower.includes("requested format") || lower.includes("invalid format") || lower.includes("format not available")) {
+      return {
+        message: "This specific stream or resolution is no longer provided by the host.",
+        tip: "Please select another resolution or the audio-only option from the format ladder above."
+      };
+    }
+
+    // 4. Bot Check / Verification
+    if (lower.includes("bot check") || lower.includes("sign in to confirm you're not a bot") || lower.includes("captcha")) {
+      return {
+        message: "The video provider requested browser bot verification.",
+        tip: "Try refreshing the page in a moment, or try another video link."
+      };
+    }
+
+    // 5. File size cap exceeded
+    if (lower.includes("larger than max-filesize") || lower.includes("size limit")) {
+      return {
+        message: msg,
+        tip: "The selected format exceeds the file size cap. Please choose a lower resolution (e.g. 720p or 480p)."
+      };
+    }
+
+    // 6. Network timeout / Gateway error (502 / 504)
+    if (lower.includes("504") || lower.includes("gateway timeout") || lower.includes("timed out")) {
+      return {
+        message: "The connection to the video provider timed out.",
+        tip: "Click Download again to retry, or choose another resolution."
+      };
+    }
+
+    if (lower.includes("502") || lower.includes("bad gateway")) {
+      return {
+        message: "Temporary gateway issue reaching the video provider.",
+        tip: "Wait a moment and try clicking Download again."
+      };
+    }
+
+    // 7. Private / Copyright / Geo-blocked
+    if (lower.includes("private video") || lower.includes("copyright") || lower.includes("geo-restricted") || lower.includes("blocked")) {
+      return {
+        message: "This video is restricted by the content creator or copyright holder.",
+        tip: "Please verify that the video is public and accessible in your region."
+      };
+    }
+
+    // 8. General fallback
+    return {
+      message: msg,
+      tip: tip || (context === "download" ? "Try selecting a different resolution above, or retry in a few moments." : "Check that the URL is public and valid, then try again.")
+    };
+  }
+
+  function showStatusError(err, context = "download") {
+    const explained = explainError(err, context);
+    setTally("failed");
+    els.statusText.textContent = explained.message;
+    if (els.statusTip && els.statusTipText) {
+      els.statusTipText.textContent = explained.tip;
+      els.statusTip.hidden = false;
+    }
+    els.downloadBtn.disabled = false;
+  }
+
+  function clearStatusTip() {
+    if (els.statusTip) {
+      els.statusTip.hidden = true;
+      if (els.statusTipText) els.statusTipText.textContent = "";
+    }
+  }
+
   // ---------- API calls ----------
 
   async function parseResponse(res, fallbackMessage) {
-    try {
-      const data = await res.json();
-      if (!res.ok) {
-        if (res.status === 401 && data.error === "LOGIN_REQUIRED") {
-          const err = new Error(data.message || fallbackMessage);
-          err.code = "LOGIN_REQUIRED";
-          err.requiredHeight = data.requiredHeight;
-          throw err;
+    let data = null;
+    const contentType = res.headers ? (res.headers.get("content-type") || "") : "";
+
+    if (contentType.includes("application/json")) {
+      try {
+        data = await res.json();
+      } catch (e) {
+        // Fallback to text
+      }
+    }
+
+    if (!data) {
+      try {
+        const text = await res.text();
+        if (text && text.trim().length > 0 && text.length < 500) {
+          data = { detail: text.trim() };
         }
-        throw new Error(data.detail || data.message || fallbackMessage);
+      } catch (e) {
+        // Ignore
       }
-      return data;
-    } catch (err) {
-      if (err.code === "LOGIN_REQUIRED") throw err;
-      if (err instanceof SyntaxError || err instanceof TypeError) {
-        throw new Error(res.ok ? fallbackMessage : `${fallbackMessage} (HTTP ${res.status})`);
+    }
+
+    if (!res.ok) {
+      if (res.status === 401 && (data?.error === "LOGIN_REQUIRED" || data?.detail === "LOGIN_REQUIRED")) {
+        const err = new Error(data?.message || data?.detail || fallbackMessage);
+        err.code = "LOGIN_REQUIRED";
+        err.status = 401;
+        err.requiredHeight = data?.requiredHeight;
+        err.tip = data?.tip || "Sign in with Google to download videos above 720p.";
+        throw err;
       }
+
+      // Handle FastAPI 422 validation error array
+      let detailMsg = "";
+      if (Array.isArray(data?.detail)) {
+        detailMsg = data.detail.map((d) => (d && d.msg ? d.msg : JSON.stringify(d))).join("; ");
+      } else if (typeof data?.detail === "string") {
+        detailMsg = data.detail;
+      } else if (typeof data?.error === "string") {
+        detailMsg = data.error;
+      } else if (typeof data?.message === "string") {
+        detailMsg = data.message;
+      }
+
+      if (!detailMsg) {
+        if (res.status === 429) {
+          detailMsg = "Too many requests — please wait a few seconds before trying again.";
+        } else if (res.status === 504) {
+          detailMsg = "The server or proxy timed out while fetching media. (HTTP 504)";
+        } else if (res.status === 502) {
+          detailMsg = "Bad gateway connecting to media provider. (HTTP 502)";
+        } else {
+          detailMsg = `${fallbackMessage} (HTTP ${res.status})`;
+        }
+      }
+
+      const err = new Error(detailMsg);
+      err.status = res.status;
+      err.tip = data?.tip;
       throw err;
     }
+
+    return data || {};
   }
 
   async function fetchInfo(url) {
@@ -471,9 +680,7 @@
       } catch (err) {
         consecutiveErrors += 1;
         if (consecutiveErrors >= MAX_RETRIES) {
-          setTally("failed");
-          els.statusText.textContent = err.message;
-          els.downloadBtn.disabled = false;
+          showStatusError(err, "poll");
           return;
         }
         setTally("active");
@@ -496,13 +703,12 @@
       } else if (data.status === "completed") {
         setTally("done");
         els.statusText.textContent = "Ready.";
+        clearStatusTip();
         els.downloadLink.href = `/api/file/${encodeURIComponent(jobId)}`;
         els.downloadLink.hidden = false;
         els.downloadBtn.disabled = false;
       } else if (data.status === "failed") {
-        setTally("failed");
-        els.statusText.textContent = data.error || "Download failed.";
-        els.downloadBtn.disabled = false;
+        showStatusError(new Error(data.error || "Download failed on server."), "download");
       }
     };
 
@@ -530,6 +736,7 @@
       try {
         await fetch("/api/auth/logout", { method: "POST" });
         setGuestUser();
+        hideMinimalAuthCard();
         // Re-render ladder to reflect locked high-resolution rungs
         if (state.formats.length > 0) {
           renderLadder(state.formats);
@@ -543,6 +750,8 @@
   els.form.addEventListener("submit", async (e) => {
     e.preventDefault();
     clearError();
+    clearStatusTip();
+    hideMinimalAuthCard();
 
     const url = els.urlInput.value.trim();
     if (!url) return;
@@ -601,6 +810,23 @@
   els.downloadBtn.addEventListener("click", async () => {
     if (!state.selectedFormatId) return;
     clearError();
+    clearStatusTip();
+
+    // If selected format is locked (> 720p) and user is a guest:
+    if (state.selectedIsLocked && !authState.authenticated) {
+      authState.pendingDownload = {
+        url: els.urlInput.value.trim(),
+        formatId: state.selectedFormatId,
+        isAudioOnly: state.selectedIsAudioOnly,
+      };
+      if (els.minimalAuthCard) {
+        els.minimalAuthCard.hidden = false;
+        renderGoogleButtons();
+        els.minimalAuthCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+      openLoginModal(`Sign in with Google to download in full HD.`);
+      return;
+    }
 
     els.downloadBtn.disabled = true;
     els.statusPanel.hidden = false;
@@ -622,12 +848,14 @@
           formatId: state.selectedFormatId,
           isAudioOnly: state.selectedIsAudioOnly,
         };
+        if (els.minimalAuthCard) {
+          els.minimalAuthCard.hidden = false;
+          renderGoogleButtons();
+        }
         openLoginModal(err.message);
         return;
       }
-      setTally("failed");
-      els.statusText.textContent = err.message;
-      els.downloadBtn.disabled = false;
+      showStatusError(err, "download");
     }
   });
 

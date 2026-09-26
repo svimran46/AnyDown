@@ -78,6 +78,23 @@
         <span class="ladder-hint" id="ladder-hint"></span>
       </div>
       <div class="ladder" id="ladder-list" role="radiogroup" aria-labelledby="ladder-label"></div>
+
+      <!-- Minimalistic Sign-In Box for > 720p qualities -->
+      <div class="minimal-auth-card" id="minimal-auth-card" hidden>
+        <div class="minimal-auth-header">
+          <div class="minimal-auth-pill">
+            <span class="lock-icon" aria-hidden="true">&#128274;</span>
+            <span id="minimal-auth-tag" class="mono">Quality Gate &gt; 720p</span>
+          </div>
+          <span class="minimal-auth-badge mono">Free Account</span>
+        </div>
+        <p class="minimal-auth-title" id="minimal-auth-title">Sign in with Google to download in full HD</p>
+        <p class="minimal-auth-sub">High-resolution formats (1080p, 1440p, 4K) require a free Google sign-in. Your download will start automatically once signed in.</p>
+        <div class="minimal-auth-btn-wrap">
+          <div id="minimal-g-signin-element"></div>
+        </div>
+      </div>
+
       <button type="button" id="download-btn" class="capture-btn" disabled>
         <span class="btn-label">Download</span>
       </button>
@@ -87,6 +104,10 @@
       <div class="status-row">
         <span class="tally-dot" id="tally-dot"></span>
         <span id="status-text" class="mono"></span>
+      </div>
+      <div id="status-tip" class="status-tip" hidden>
+        <span class="status-tip-icon" aria-hidden="true">&#128161;</span>
+        <span id="status-tip-text"></span>
       </div>
       <a id="download-link" class="download-link" hidden download>
         <span class="btn-label">Save file</span>

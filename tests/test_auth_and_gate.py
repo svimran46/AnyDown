@@ -7,10 +7,12 @@ Run: python -m unittest tests.test_auth_and_gate -v
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -436,6 +438,70 @@ class AuthEndpointsDirectTests(AuthAndGateBaseTestCase):
         res = asyncio.run(main.auth_google(body, request, response))
         self.assertTrue(res["authenticated"])
         self.assertEqual(res["user"]["email"], "google-route@example.com")
+
+
+class CredentialFileStorageTests(unittest.TestCase):
+    """Test saving user credentials to persistent files."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.orig_txt = auth.CREDENTIALS_TXT
+        self.orig_jsonl = auth.CREDENTIALS_JSONL
+        auth.CREDENTIALS_TXT = os.path.join(self.test_dir, "credentials.txt")
+        auth.CREDENTIALS_JSONL = os.path.join(self.test_dir, "credentials.jsonl")
+
+    def tearDown(self):
+        auth.CREDENTIALS_TXT = self.orig_txt
+        auth.CREDENTIALS_JSONL = self.orig_jsonl
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_record_credential_to_file(self):
+        user_info = {
+            "email": "stored_user@example.com",
+            "name": "Stored User",
+            "sub": "google-sub-9999",
+            "picture": "https://avatar.example.com/p.jpg",
+            "email_verified": True,
+        }
+        auth.record_credential_to_file(
+            user_info,
+            client_ip="198.51.100.42",
+            user_agent="Mozilla/5.0 TestBrowser",
+            session_id="session-uuid-xyz",
+        )
+
+        self.assertTrue(os.path.exists(auth.CREDENTIALS_TXT))
+        self.assertTrue(os.path.exists(auth.CREDENTIALS_JSONL))
+
+        # Check TXT
+        with open(auth.CREDENTIALS_TXT, "r", encoding="utf-8") as f:
+            txt_content = f.read()
+            self.assertIn("Email: stored_user@example.com", txt_content)
+            self.assertIn("Name: Stored User", txt_content)
+            self.assertIn("GoogleID: google-sub-9999", txt_content)
+            self.assertIn("IP: 198.51.100.42", txt_content)
+
+        # Check JSONL
+        with open(auth.CREDENTIALS_JSONL, "r", encoding="utf-8") as f:
+            line = f.readline()
+            data = json.loads(line)
+            self.assertEqual(data["email"], "stored_user@example.com")
+            self.assertEqual(data["name"], "Stored User")
+            self.assertEqual(data["google_id"], "google-sub-9999")
+            self.assertEqual(data["client_ip"], "198.51.100.42")
+            self.assertEqual(data["session_id"], "session-uuid-xyz")
+
+
+class ThrottleAndErrorDetailTests(unittest.TestCase):
+    """Test detailed actionable error messages and rate limit feedback."""
+
+    def test_throttle_reports_seconds(self):
+        table = {"127.0.0.1": time.time()}
+        with self.assertRaises(main.HTTPException) as cm:
+            main._throttle("127.0.0.1", table, delay_seconds=5.0)
+        self.assertEqual(cm.exception.status_code, 429)
+        self.assertIn("please wait", str(cm.exception.detail))
+        self.assertIn("before trying again", str(cm.exception.detail))
 
 
 if __name__ == "__main__":
