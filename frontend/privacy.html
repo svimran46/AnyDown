@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Privacy Policy — AnyDown</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css" />
+<style>
+  .legal-content {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 32px;
+    margin-bottom: 32px;
+    line-height: 1.65;
+  }
+  .legal-content h1 {
+    font-family: var(--font-display);
+    font-size: 24px;
+    margin-top: 0;
+    margin-bottom: 20px;
+    color: var(--text);
+  }
+  .legal-content h2 {
+    font-family: var(--font-display);
+    font-size: 16px;
+    margin-top: 28px;
+    margin-bottom: 12px;
+    color: var(--signal);
+    letter-spacing: 0.02em;
+  }
+  .legal-content p, .legal-content li {
+    font-size: 14px;
+    color: var(--text-muted);
+  }
+  .legal-content ul {
+    padding-left: 20px;
+    margin-bottom: 16px;
+  }
+  .back-link {
+    display: inline-block;
+    color: var(--signal);
+    text-decoration: none;
+    font-size: 13px;
+    font-family: var(--font-mono);
+    margin-bottom: 20px;
+  }
+  .back-link:hover {
+    text-decoration: underline;
+  }
+</style>
+</head>
+<body>
+
+<div class="frame">
+  <header class="nameplate">
+    <div class="nameplate-mark" aria-hidden="true">&#9670;</div>
+    <div class="nameplate-text">
+      <span class="nameplate-title">CAPTURE / ANYDOWN</span>
+      <span class="nameplate-sub">media retrieval utility</span>
+    </div>
+  </header>
+
+  <main>
+    <a href="/" class="back-link">&larr; Back to App</a>
+    <article class="legal-content">
+      <h1>Privacy Policy</h1>
+      <p class="mono">Last Updated: September 2026</p>
+
+      <h2>1. Overview</h2>
+      <p>AnyDown ("we", "our") provides a media retrieval and download utility. This Privacy Policy explains what information we collect, how it is used, and your rights regarding your personal information.</p>
+
+      <h2>2. Information We Collect</h2>
+      <ul>
+        <li><strong>Google Identity & Profile Information:</strong> When you choose to sign in with Google, we receive your Google Subject ID (<code>sub</code>), email address, name, and profile avatar URL provided by Google Identity Services. We do not receive or store your Google password.</li>
+        <li><strong>Session Information:</strong> To keep you securely logged in across requests, we store a cryptographic hash of your session token in our database and set a secure, HttpOnly cookie on your browser.</li>
+        <li><strong>Download Event Metadata:</strong> We record operational download events (provider hostname, requested resolution height, authentication status, and timestamp) for rate limiting and service integrity. We do not store complete user source URLs in event logs.</li>
+      </ul>
+
+      <h2>3. Cookies & Local State</h2>
+      <p>We use a single, secure first-party cookie (<code>__Host-anydown_session</code> / <code>anydown_session</code>) solely for maintaining your authenticated session. This cookie is marked <code>HttpOnly</code>, <code>Secure</code>, and <code>SameSite=Lax</code>. We do not use third-party tracking or advertising cookies.</p>
+
+      <h2>4. Data Retention & Temporary Storage</h2>
+      <ul>
+        <li>Retrieved media files are temporarily stored in server memory/disk only for the duration required to stream the file to your device. Temporary files and expired jobs are systematically purged every 5 minutes (maximum file lifetime of 30 minutes).</li>
+        <li>User account records and session tokens are retained until session expiration or account deletion.</li>
+      </ul>
+
+      <h2>5. Account Deletion & Rights</h2>
+      <p>You can revoke your session at any time by clicking "Sign out". If you wish to delete your user account and all associated records, contact the service administrator or submit a deletion request.</p>
+
+      <h2>6. Third-Party Services</h2>
+      <p>Our authentication relies on Google Identity Services (Google LLC). Media retrieval utilizes the open-source utility <code>yt-dlp</code> communicating with external media content providers chosen by the user.</p>
+    </article>
+  </main>
+
+  <footer class="footer">
+    <p>Runs on <span class="mono">yt-dlp</span>. For your own content, or content you have the rights to.</p>
+  </footer>
+</div>
+
+</body>
+</html>

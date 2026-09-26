@@ -9,13 +9,16 @@ import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import yt_dlp
+import auth
+import authorization
+import database
 from downloader import (
     APP_VERSION,
     MAX_FILESIZE_BYTES,
@@ -34,13 +37,34 @@ FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "5"))
 INFO_THROTTLE_SECONDS = float(os.getenv("INFO_THROTTLE_SECONDS", "1"))
+AUTH_THROTTLE_SECONDS = float(os.getenv("AUTH_THROTTLE_SECONDS", "2"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 _last_download_request_at: dict[str, float] = {}
 _last_info_request_at: dict[str, float] = {}
+_last_auth_request_at: dict[str, float] = {}
 _background_tasks: set[asyncio.Task] = set()
+
+# Short-lived in-memory metadata cache so /api/download does not duplicate yt-dlp extraction
+_info_cache: dict[str, tuple[float, dict]] = {}
+_info_cache_lock = asyncio.Lock()
+
+
+async def _get_or_fetch_info(url: str) -> dict:
+    now = time.time()
+    cached = _info_cache.get(url)
+    if cached and (now - cached[0] < 300):
+        return cached[1]
+
+    info = await asyncio.to_thread(fetch_info, url)
+    async with _info_cache_lock:
+        _info_cache[url] = (now, info)
+        if len(_info_cache) > 256:
+            oldest_key = min(_info_cache.keys(), key=lambda k: _info_cache[k][0])
+            _info_cache.pop(oldest_key, None)
+    return info
 
 
 async def _cleanup_loop():
@@ -51,6 +75,13 @@ async def _cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize database tables and migrations
+    try:
+        await asyncio.to_thread(database.init_db)
+    except Exception as exc:
+        import logging
+        logging.getLogger("anydown").error("Failed to initialize database: %s", exc)
+
     cleanup_task = asyncio.create_task(_cleanup_loop())
     yield
     cleanup_task.cancel()
@@ -64,7 +95,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(*_background_tasks, return_exceptions=True)
 
 
-app = FastAPI(title="AnyDown API", version="2.0", lifespan=lifespan)
+app = FastAPI(title="AnyDown API", version="2.1", lifespan=lifespan)
 
 # Same-origin is the normal deployment mode. Explicit origins can be supplied
 # if a separate frontend is used.
@@ -73,6 +104,7 @@ if allowed_origins:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
+        allow_credentials=True,
         allow_methods=["GET", "POST"],
         allow_headers=["Content-Type"],
     )
@@ -87,6 +119,11 @@ class DownloadRequest(BaseModel):
     format_id: str | None = Field(default=None, max_length=100)
     format_has_audio: bool = False
     audio_only: bool = False
+    height: int | None = Field(default=None, ge=0, le=10000)
+
+
+class GoogleAuthRequest(BaseModel):
+    credential: str = Field(min_length=10, max_length=8192)
 
 
 def _validate_url_syntax(url: str) -> str:
@@ -186,6 +223,21 @@ def _throttle(client_ip: str, table: dict[str, float], delay_seconds: float) -> 
     table[client_ip] = now
 
 
+@app.get("/api/config")
+def get_public_config():
+    """Expose non-sensitive client configuration for Google Sign-In and feature gates."""
+    return {
+        "google_client_id": auth.GOOGLE_CLIENT_ID,
+        "googleClientId": auth.GOOGLE_CLIENT_ID,
+        "guest_max_height": authorization.GUEST_MAX_HEIGHT,
+        "guestMaxHeight": authorization.GUEST_MAX_HEIGHT,
+        "app_base_url": os.getenv("APP_BASE_URL", "").strip(),
+    }
+
+
+get_config = get_public_config
+
+
 @app.get("/api/health")
 def health():
     cookies = youtube_cookies_status()
@@ -205,18 +257,81 @@ def health():
     }
 
 
-@app.post("/api/info")
-async def get_info(payload: InfoRequest, request: Request):
-    await _validate_public_url(payload.url)
+# --------------------------------------------------------------------------
+# Authentication endpoints
+# --------------------------------------------------------------------------
+
+@app.post("/api/auth/google")
+async def auth_google(payload: GoogleAuthRequest, request: Request, response: Response):
+    client_ip = _get_client_ip(request)
+    _throttle(client_ip, _last_auth_request_at, AUTH_THROTTLE_SECONDS)
+    return auth.authenticate_google_user(payload.credential, request, response)
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    user = auth.get_current_user(request)
+    if not user:
+        return {"authenticated": False, "user": None}
+    return {
+        "authenticated": True,
+        "user": {
+            "id": str(user["id"]),
+            "email": user["email"],
+            "name": user.get("name"),
+            "avatarUrl": user.get("avatar_url"),
+        },
+    }
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response):
+    return auth.logout_user(request, response)
+
+
+# --------------------------------------------------------------------------
+# Media Inspection & Quality Gating
+# --------------------------------------------------------------------------
+
+async def _inspect_media_core(url: str, request: Request) -> dict:
+    await _validate_public_url(url)
     client_ip = _get_client_ip(request)
     _throttle(client_ip, _last_info_request_at, INFO_THROTTLE_SECONDS)
     try:
-        return await asyncio.to_thread(fetch_info, payload.url)
+        info = await _get_or_fetch_info(url)
     except UnsupportedURLError as exc:
         raise HTTPException(status_code=400, detail=f"Couldn't read that URL: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Couldn't read that URL: {exc}") from exc
 
+    current_user = auth.get_current_user(request)
+    annotated_formats = authorization.annotate_formats_with_locks(info.get("formats", []), current_user)
+
+    result = dict(info)
+    result["formats"] = annotated_formats
+    result["source"] = {
+        "title": info.get("title", "untitled"),
+        "thumbnail": info.get("thumbnail"),
+        "duration": info.get("duration"),
+        "uploader": info.get("uploader"),
+        "extractor": info.get("extractor"),
+    }
+    return result
+
+
+@app.post("/api/media/inspect")
+async def media_inspect(payload: InfoRequest, request: Request):
+    return await _inspect_media_core(payload.url, request)
+
+
+@app.post("/api/info")
+async def get_info(payload: InfoRequest, request: Request):
+    return await _inspect_media_core(payload.url, request)
+
+
+# --------------------------------------------------------------------------
+# Download pipeline with server-enforced quality gate
+# --------------------------------------------------------------------------
 
 async def _execute_download_job(job_id: str, payload: DownloadRequest) -> None:
     async with _download_semaphore:
@@ -271,6 +386,42 @@ async def start_download(payload: DownloadRequest, request: Request):
         if not 1 <= len(payload.format_id) <= 100 or any(c not in allowed for c in payload.format_id):
             raise HTTPException(status_code=400, detail="Invalid format_id.")
 
+    # 1. Authenticate user from session cookie
+    current_user = auth.get_current_user(request)
+
+    # 2. Server resolves actual format height to prevent client bypass
+    actual_height: int | None = payload.height
+    if not payload.audio_only and payload.format_id and payload.format_id != "audio-only":
+        try:
+            info = await _get_or_fetch_info(payload.url)
+            resolved = authorization.resolve_format_height(
+                info.get("formats", []), payload.format_id, payload.audio_only
+            )
+            if resolved is not None:
+                actual_height = resolved
+        except Exception:
+            pass
+
+    # 3. Centralized quality authorization enforcement
+    if not authorization.can_download_format(current_user, actual_height):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "LOGIN_REQUIRED",
+                "message": f"Sign in with Google to download videos above {authorization.GUEST_MAX_HEIGHT}p.",
+                "requiredHeight": actual_height or 1080,
+            },
+        )
+
+    # 4. Record download event
+    database.record_download_event(
+        user_id=str(current_user["id"]) if current_user else None,
+        provider=urlparse(payload.url).hostname,
+        requested_height=actual_height,
+        authenticated=current_user is not None,
+        status="queued",
+    )
+
     job = job_manager.create_job(payload.url)
 
     # Execute in background task so HTTP response returns immediately with job_id
@@ -297,6 +448,22 @@ def get_file(job_id: str):
     if job.status != JobStatus.COMPLETED or not job.filepath or not os.path.exists(job.filepath):
         raise HTTPException(status_code=409, detail=f"File not ready yet (status: {job.status}).")
     return FileResponse(job.filepath, filename=job.filename, media_type="application/octet-stream")
+
+
+@app.get("/privacy")
+def privacy_page():
+    path = os.path.join(FRONTEND_DIR, "privacy.html")
+    if os.path.exists(path):
+        return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Privacy page not found.")
+
+
+@app.get("/terms")
+def terms_page():
+    path = os.path.join(FRONTEND_DIR, "terms.html")
+    if os.path.exists(path):
+        return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Terms page not found.")
 
 
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

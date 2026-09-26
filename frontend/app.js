@@ -1,5 +1,5 @@
-// CAPTURE — frontend logic. No build step, no dependencies.
-// Talks to the same-origin API: /api/info, /api/download, /api/status/:id, /api/file/:id
+// CAPTURE — frontend logic with Google Authentication & Quality Gating.
+// Talks to the same-origin API: /api/config, /api/auth/*, /api/media/inspect, /api/download, /api/status/:id, /api/file/:id
 
 (() => {
   "use strict";
@@ -21,12 +21,34 @@
 
     ladderPanel: $("ladder-panel"),
     ladderList: $("ladder-list"),
+    ladderHint: $("ladder-hint"),
     downloadBtn: $("download-btn"),
 
     statusPanel: $("status-panel"),
     tallyDot: $("tally-dot"),
     statusText: $("status-text"),
     downloadLink: $("download-link"),
+
+    authBar: $("auth-bar"),
+    loginTriggerBtn: $("login-trigger-btn"),
+    userBadge: $("user-badge"),
+    userAvatar: $("user-avatar"),
+    userName: $("user-name"),
+    logoutBtn: $("logout-btn"),
+
+    loginModal: $("login-modal"),
+    modalCloseBtn: $("modal-close-btn"),
+    modalDesc: $("modal-desc"),
+    gSigninElement: $("g-signin-element"),
+  };
+
+  const authState = {
+    authenticated: false,
+    user: null,
+    googleClientId: null,
+    guestMaxHeight: 720,
+    pendingDownload: null, // { url, formatId, isAudioOnly }
+    gisInitialized: false,
   };
 
   const state = {
@@ -88,7 +110,185 @@
     els.fetchBtn.querySelector(".btn-label").textContent = isFetching ? "Fetching…" : "Fetch";
   }
 
+  // ---------- auth UI management ----------
+
+  function setAuthenticatedUser(user) {
+    authState.authenticated = true;
+    authState.user = user;
+
+    if (els.loginTriggerBtn) els.loginTriggerBtn.hidden = true;
+    if (els.userBadge) els.userBadge.hidden = false;
+    if (els.userName) els.userName.textContent = user.name || (user.email ? user.email.split("@")[0] : "User");
+    if (els.userAvatar) {
+      if (user.avatarUrl) {
+        els.userAvatar.src = user.avatarUrl;
+        els.userAvatar.hidden = false;
+      } else {
+        els.userAvatar.hidden = true;
+      }
+    }
+    if (els.ladderHint) {
+      els.ladderHint.textContent = "All qualities unlocked";
+    }
+  }
+
+  function setGuestUser() {
+    authState.authenticated = false;
+    authState.user = null;
+
+    if (els.loginTriggerBtn) els.loginTriggerBtn.hidden = false;
+    if (els.userBadge) els.userBadge.hidden = true;
+    if (els.userAvatar) els.userAvatar.removeAttribute("src");
+    if (els.userName) els.userName.textContent = "";
+    if (els.ladderHint) {
+      els.ladderHint.textContent = `> ${authState.guestMaxHeight}p requires sign in`;
+    }
+  }
+
+  function openLoginModal(desc) {
+    if (desc && els.modalDesc) {
+      els.modalDesc.textContent = desc;
+    } else if (els.modalDesc) {
+      els.modalDesc.textContent = `Sign in with Google to unlock 1080p, 1440p, 4K, and high-bitrate video downloads.`;
+    }
+    if (els.loginModal) els.loginModal.hidden = false;
+    renderGoogleButton();
+  }
+
+  function closeLoginModal() {
+    if (els.loginModal) els.loginModal.hidden = true;
+  }
+
+  function renderGoogleButton() {
+    if (!window.google || !window.google.accounts || !window.google.accounts.id) return;
+    if (!els.gSigninElement) return;
+
+    els.gSigninElement.innerHTML = "";
+    google.accounts.id.renderButton(els.gSigninElement, {
+      type: "standard",
+      theme: "filled_black",
+      size: "large",
+      text: "signin_with",
+      shape: "rectangular",
+      logo_alignment: "left",
+      width: 280,
+    });
+  }
+
+  function setupGoogleIdentityServices() {
+    if (!window.google || !window.google.accounts || !window.google.accounts.id) {
+      setTimeout(setupGoogleIdentityServices, 250);
+      return;
+    }
+    if (authState.gisInitialized || !authState.googleClientId) return;
+
+    google.accounts.id.initialize({
+      client_id: authState.googleClientId,
+      callback: handleGoogleCredentialResponse,
+      auto_select: false,
+      cancel_on_tap_outside: true,
+    });
+    authState.gisInitialized = true;
+    renderGoogleButton();
+  }
+
+  async function handleGoogleCredentialResponse(googleResponse) {
+    if (!googleResponse || !googleResponse.credential) return;
+
+    try {
+      const res = await fetch("/api/auth/google", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credential: googleResponse.credential }),
+      });
+      const data = await parseResponse(res, "Sign in failed.");
+      if (data.authenticated && data.user) {
+        setAuthenticatedUser(data.user);
+        closeLoginModal();
+
+        // Refresh ladder rungs to unlock qualities
+        if (state.formats.length > 0) {
+          renderLadder(state.formats);
+        }
+
+        // Phase 10: Automatic resume of requested download!
+        if (authState.pendingDownload) {
+          const pending = authState.pendingDownload;
+          authState.pendingDownload = null;
+          resumePendingDownload(pending);
+        }
+      }
+    } catch (err) {
+      showError(err.message);
+    }
+  }
+
+  async function resumePendingDownload(pending) {
+    if (!pending || !pending.url || !pending.formatId) return;
+
+    // Find and select the corresponding rung
+    const targetRung = Array.from(els.ladderList.querySelectorAll(".rung")).find(
+      (r) => r.dataset.formatId === pending.formatId
+    );
+    if (targetRung) {
+      selectRung(targetRung);
+    }
+
+    clearError();
+    els.downloadBtn.disabled = true;
+    els.statusPanel.hidden = false;
+    els.downloadLink.hidden = true;
+    setTally("active");
+    els.statusText.textContent = "Starting download…";
+
+    try {
+      const job = await startDownload(pending.url, pending.formatId, pending.isAudioOnly);
+      pollStatus(job.job_id);
+    } catch (err) {
+      setTally("failed");
+      els.statusText.textContent = err.message;
+      els.downloadBtn.disabled = false;
+    }
+  }
+
+  async function initAuth() {
+    try {
+      const cfgRes = await fetch("/api/config");
+      if (cfgRes.ok) {
+        const cfg = await cfgRes.json();
+        authState.googleClientId = cfg.google_client_id;
+        authState.guestMaxHeight = cfg.guest_max_height || 720;
+      }
+    } catch (e) {
+      console.warn("Could not load /api/config", e);
+    }
+
+    try {
+      const meRes = await fetch("/api/auth/me");
+      if (meRes.ok) {
+        const meData = await meRes.json();
+        if (meData.authenticated && meData.user) {
+          setAuthenticatedUser(meData.user);
+        } else {
+          setGuestUser();
+        }
+      } else {
+        setGuestUser();
+      }
+    } catch (e) {
+      setGuestUser();
+    }
+
+    setupGoogleIdentityServices();
+  }
+
   // ---------- ladder rendering ----------
+
+  function isFormatLocked(fmt) {
+    if (authState.authenticated) return false;
+    if (fmt.locked !== undefined) return fmt.locked;
+    return !!(fmt.height && fmt.height > authState.guestMaxHeight);
+  }
 
   function renderLadder(formats) {
     state.formats = formats;
@@ -106,24 +306,56 @@
       rung.dataset.formatId = fmt.format_id;
       rung.dataset.audioOnly = fmt.format_id === "audio-only" ? "true" : "false";
 
+      const locked = isFormatLocked(fmt);
+      if (locked) {
+        rung.classList.add("locked");
+        rung.dataset.locked = "true";
+      }
+
       const label = document.createElement("span");
       label.className = "rung-label";
+
+      let textLabel = "Video";
       if (fmt.format_id === "audio-only") {
-        label.textContent = "Audio only (MP3)";
+        textLabel = "Audio only (MP3)";
       } else if (fmt.note) {
-        label.textContent = fmt.note;
+        textLabel = fmt.note;
       } else if (!fmt.has_video) {
-        label.textContent = "Audio";
-      } else {
-        label.textContent = "Video";
+        textLabel = "Audio";
+      }
+      label.textContent = textLabel;
+
+      const rightContainer = document.createElement("span");
+      rightContainer.className = "rung-right";
+
+      if (locked) {
+        const lockBadge = document.createElement("span");
+        lockBadge.className = "rung-lock-badge";
+        lockBadge.innerHTML = "&#128274; Sign in to unlock";
+        rightContainer.appendChild(lockBadge);
       }
 
       const spec = document.createElement("span");
       spec.className = "rung-spec mono";
       spec.textContent = formatSpec(fmt);
+      rightContainer.appendChild(spec);
 
-      rung.append(label, spec);
-      rung.addEventListener("click", () => selectRung(rung));
+      rung.append(label, rightContainer);
+
+      rung.addEventListener("click", () => {
+        if (rung.dataset.locked === "true") {
+          // Unauthenticated user clicked locked format: prompt Google login and record pending download
+          authState.pendingDownload = {
+            url: els.urlInput.value.trim(),
+            formatId: fmt.format_id,
+            isAudioOnly: fmt.format_id === "audio-only",
+          };
+          openLoginModal(`Sign in with Google to download ${fmt.resolution || textLabel}.`);
+          return;
+        }
+        selectRung(rung);
+      });
+
       rung.addEventListener("keydown", (e) => handleRungKeydown(e, rung));
 
       els.ladderList.appendChild(rung);
@@ -150,7 +382,7 @@
 
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      selectRung(rung);
+      rung.click();
       return;
     }
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -162,13 +394,21 @@
 
   // ---------- API calls ----------
 
-  // Backend error responses are not always JSON; parse defensively.
   async function parseResponse(res, fallbackMessage) {
     try {
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || fallbackMessage);
+      if (!res.ok) {
+        if (res.status === 401 && data.error === "LOGIN_REQUIRED") {
+          const err = new Error(data.message || fallbackMessage);
+          err.code = "LOGIN_REQUIRED";
+          err.requiredHeight = data.requiredHeight;
+          throw err;
+        }
+        throw new Error(data.detail || data.message || fallbackMessage);
+      }
       return data;
     } catch (err) {
+      if (err.code === "LOGIN_REQUIRED") throw err;
       if (err instanceof SyntaxError || err instanceof TypeError) {
         throw new Error(res.ok ? fallbackMessage : `${fallbackMessage} (HTTP ${res.status})`);
       }
@@ -177,7 +417,7 @@
   }
 
   async function fetchInfo(url) {
-    const res = await fetch("/api/info", {
+    const res = await fetch("/api/media/inspect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
@@ -229,8 +469,6 @@
         data = await fetchStatus(jobId);
         consecutiveErrors = 0;
       } catch (err) {
-        // Transient network hiccups or a restarting server shouldn't kill a
-        // healthy download; only give up after several consecutive failures.
         consecutiveErrors += 1;
         if (consecutiveErrors >= MAX_RETRIES) {
           setTally("failed");
@@ -273,6 +511,35 @@
 
   // ---------- event wiring ----------
 
+  if (els.loginTriggerBtn) {
+    els.loginTriggerBtn.addEventListener("click", () => openLoginModal());
+  }
+
+  if (els.modalCloseBtn) {
+    els.modalCloseBtn.addEventListener("click", () => closeLoginModal());
+  }
+
+  if (els.loginModal) {
+    els.loginModal.addEventListener("click", (e) => {
+      if (e.target === els.loginModal) closeLoginModal();
+    });
+  }
+
+  if (els.logoutBtn) {
+    els.logoutBtn.addEventListener("click", async () => {
+      try {
+        await fetch("/api/auth/logout", { method: "POST" });
+        setGuestUser();
+        // Re-render ladder to reflect locked high-resolution rungs
+        if (state.formats.length > 0) {
+          renderLadder(state.formats);
+        }
+      } catch (err) {
+        console.error("Logout failed:", err);
+      }
+    });
+  }
+
   els.form.addEventListener("submit", async (e) => {
     e.preventDefault();
     clearError();
@@ -291,7 +558,6 @@
       const info = await fetchInfo(url);
 
       els.thumb.onerror = () => {
-        // No thumbnail available: hide the box instead of a broken-image icon.
         els.mediaPanel.classList.add("no-thumb");
         els.thumb.removeAttribute("src");
       };
@@ -321,6 +587,7 @@
         has_audio: true,
         filesize: null,
         note: "Audio only (MP3)",
+        locked: false,
       });
       renderLadder(formats);
       els.ladderPanel.hidden = false;
@@ -346,9 +613,24 @@
       const job = await startDownload(url, state.selectedFormatId, state.selectedIsAudioOnly);
       pollStatus(job.job_id);
     } catch (err) {
+      if (err.code === "LOGIN_REQUIRED") {
+        setTally(null);
+        els.statusPanel.hidden = true;
+        els.downloadBtn.disabled = false;
+        authState.pendingDownload = {
+          url: els.urlInput.value.trim(),
+          formatId: state.selectedFormatId,
+          isAudioOnly: state.selectedIsAudioOnly,
+        };
+        openLoginModal(err.message);
+        return;
+      }
       setTally("failed");
       els.statusText.textContent = err.message;
       els.downloadBtn.disabled = false;
     }
   });
+
+  // Initialize authentication on page load
+  initAuth();
 })();

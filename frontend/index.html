@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="style.css" />
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 
@@ -19,7 +20,25 @@
       <span class="nameplate-title">CAPTURE</span>
       <span class="nameplate-sub">media retrieval utility</span>
     </div>
-    <div class="nameplate-status"><span class="status-dot"></span>READY</div>
+    <div class="nameplate-right">
+      <div class="auth-bar" id="auth-bar">
+        <button type="button" class="auth-btn" id="login-trigger-btn">
+          <svg class="google-icon" viewBox="0 0 24 24" width="14" height="14">
+            <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.65v3h3.88c2.27-2.09 3.66-5.17 3.66-9.09z"/>
+            <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.26v3.09C3.29 21.48 7.35 24 12 24z"/>
+            <path fill="#FBBC05" d="M5.28 14.32c-.25-.72-.38-1.49-.38-2.32s.13-1.6.38-2.32V6.59H1.26C.46 8.18 0 9.99 0 12s.46 3.82 1.26 5.41l4.02-3.09z"/>
+            <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.35 0 3.29 2.52 1.26 6.59l4.02 3.09c.95-2.83 3.6-4.93 6.72-4.93z"/>
+          </svg>
+          <span class="btn-label">Sign in</span>
+        </button>
+        <div class="user-badge" id="user-badge" hidden>
+          <img id="user-avatar" class="user-avatar" alt="Avatar" src="" />
+          <span id="user-name" class="user-name mono"></span>
+          <button type="button" class="logout-btn" id="logout-btn" title="Sign out">Sign out</button>
+        </div>
+      </div>
+      <div class="nameplate-status"><span class="status-dot"></span>READY</div>
+    </div>
   </header>
 
   <main>
@@ -54,7 +73,10 @@
     </section>
 
     <section class="panel ladder-panel" id="ladder-panel" hidden aria-labelledby="ladder-label">
-      <p class="eyebrow" id="ladder-label">Format ladder</p>
+      <div class="ladder-header">
+        <p class="eyebrow" id="ladder-label">Format ladder</p>
+        <span class="ladder-hint" id="ladder-hint"></span>
+      </div>
       <div class="ladder" id="ladder-list" role="radiogroup" aria-labelledby="ladder-label"></div>
       <button type="button" id="download-btn" class="capture-btn" disabled>
         <span class="btn-label">Download</span>
@@ -75,8 +97,31 @@
 
   <footer class="footer">
     <p>Runs on <span class="mono">yt-dlp</span>. For your own content, or content you have the rights to.</p>
+    <p class="footer-links">
+      <a href="/terms">Terms of Service</a> &middot; <a href="/privacy">Privacy Policy</a>
+    </p>
   </footer>
 
+</div>
+
+<!-- Google Login Modal Dialog -->
+<div class="modal-backdrop" id="login-modal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <button type="button" class="modal-close" id="modal-close-btn" aria-label="Close">&times;</button>
+    <div class="modal-header">
+      <div class="nameplate-mark" aria-hidden="true">&#9670;</div>
+      <h3 class="modal-title" id="modal-title">Sign in to AnyDown</h3>
+    </div>
+    <p class="modal-desc" id="modal-desc">
+      Sign in with Google to unlock 1080p, 1440p, 4K, and high-bitrate video downloads.
+    </p>
+    <div class="google-btn-container" id="google-btn-container">
+      <div id="g-signin-element"></div>
+    </div>
+    <p class="modal-notice mono">
+      By signing in, you agree to our <a href="/terms" target="_blank">Terms</a> and <a href="/privacy" target="_blank">Privacy Policy</a>.
+    </p>
+  </div>
 </div>
 
 <script src="app.js"></script>

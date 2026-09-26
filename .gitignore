@@ -11,6 +11,9 @@ env/
 /downloads/
 *.part
 *.ytdl
+*.db
+*.sqlite*
+*.sqlite3
 
 # Local secrets
 cookies.txt
