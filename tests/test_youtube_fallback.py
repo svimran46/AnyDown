@@ -138,6 +138,15 @@ class DiagnosticsTests(unittest.TestCase):
         )
         self.assertIn("/nonexistent/cookies.txt", msg)
 
+    def test_bot_check_handles_curly_apostrophe(self):
+        downloader.YTDLP_POT_PROVIDER_URL = ""
+        downloader.YOUTUBE_COOKIES_FILE = ""
+        curly_msg = "ERROR: [youtube] 12345: Sign in to confirm you’re not a bot."
+        err = downloader.UnsupportedURLError(curly_msg)
+        self.assertTrue(downloader._is_youtube_retryable_error(err))
+        msg = downloader._friendly_error(err)
+        self.assertIn(f"[AnyDown {downloader.APP_VERSION}]", msg)
+
 
 class VersionMarkerTests(unittest.TestCase):
     """The app version must be visible in health output and bot-check errors

@@ -212,7 +212,7 @@ DEFAULT_YOUTUBE_CLIENTS = ("mweb", "tv", "")
 # reported there does not match the latest commit on main, the service is
 # running an older image and must be redeployed (Render: "Clear build cache
 # & deploy" — Docker layer caching can otherwise serve a stale image).
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 
 # Loopback peers are always exempt: the bgutil provider runs on 127.0.0.1 in
@@ -449,10 +449,11 @@ def _youtube_options(ydl_opts: dict, client: str | None = None) -> None:
 
 def _is_youtube_retryable_error(error: Exception) -> bool:
     """Return True for failures where another YouTube client is worth trying."""
-    text = str(error).lower()
+    text = str(error).lower().replace("’", "'")
     markers = (
         "sign in to confirm you're not a bot",
         "confirm you're not a bot",
+        "not a bot",
         "login_required",
         "http error 403",
         "http error 429",
@@ -603,7 +604,7 @@ def _apply_platform_options(url: str, ydl_opts: dict) -> None:
 
 def _friendly_error(error: Exception) -> str:
     text = str(error)
-    lower = text.lower()
+    lower = text.lower().replace("’", "'")
 
     if "larger than max-filesize" in lower or "max-filesize" in lower or "max_filesize" in lower:
         limit_gb = MAX_FILESIZE_BYTES / (1024 * 1024 * 1024)
@@ -615,7 +616,7 @@ def _friendly_error(error: Exception) -> str:
     if "private or local network addresses are not supported" in lower:
         return "That URL points at a private or local network address and is not allowed."
 
-    if "sign in to confirm you're not a bot" in lower or "confirm you're not a bot" in lower:
+    if "sign in to confirm you're not a bot" in lower or "confirm you're not a bot" in lower or "not a bot" in lower:
         # Report the actual server state instead of blaming cookies by default.
         cookies = youtube_cookies_status()
         pot = pot_provider_status()
