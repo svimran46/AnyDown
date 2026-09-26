@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import socket
+import tempfile
 import threading
 import urllib.request
 from typing import Callable
@@ -212,7 +213,7 @@ DEFAULT_YOUTUBE_CLIENTS = ("mweb", "tv", "")
 # reported there does not match the latest commit on main, the service is
 # running an older image and must be redeployed (Render: "Clear build cache
 # & deploy" — Docker layer caching can otherwise serve a stale image).
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 
 
 # Loopback peers are always exempt: the bgutil provider runs on 127.0.0.1 in
@@ -295,6 +296,34 @@ def youtube_cookies_status() -> dict:
         except OSError:
             fmt = None
     return {"configured": True, "file_found": found, "format": fmt}
+
+
+def _get_effective_cookiefile() -> str | None:
+    """Return a path to a writable copy of YOUTUBE_COOKIES_FILE if configured.
+
+    Render mounts secret files at /etc/secrets as read-only. yt-dlp tries to
+    write updated session cookies back to the cookiefile on exit, which fails
+    with [Errno 30] Read-only file system. We copy it to /tmp so yt-dlp has a
+    writable file.
+    """
+    if not YOUTUBE_COOKIES_FILE or not os.path.isfile(YOUTUBE_COOKIES_FILE):
+        return None
+
+    if os.access(YOUTUBE_COOKIES_FILE, os.W_OK):
+        return YOUTUBE_COOKIES_FILE
+
+    dest = os.path.join(tempfile.gettempdir(), "anydown_youtube_cookies.txt")
+    try:
+        if not os.path.exists(dest) or os.path.getmtime(YOUTUBE_COOKIES_FILE) > os.path.getmtime(dest):
+            shutil.copyfile(YOUTUBE_COOKIES_FILE, dest)
+            try:
+                os.chmod(dest, 0o600)
+            except OSError:
+                pass
+        return dest
+    except Exception as exc:
+        diagnostic_logger.warning("[COOKIES] Could not copy read-only cookies file: %s", exc)
+        return YOUTUBE_COOKIES_FILE
 
 
 def pot_provider_status(timeout: float = 2.0) -> dict:
@@ -430,7 +459,9 @@ def _youtube_options(ydl_opts: dict, client: str | None = None) -> None:
                 "cookies database)."
             )
         else:
-            ydl_opts["cookiefile"] = YOUTUBE_COOKIES_FILE
+            cookiefile_path = _get_effective_cookiefile()
+            if cookiefile_path:
+                ydl_opts["cookiefile"] = cookiefile_path
 
     # yt-dlp's current YouTube support uses EJS + a JS runtime. Deno is the
     # only runtime enabled by default; others must be explicitly enabled.

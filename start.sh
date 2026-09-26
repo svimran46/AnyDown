@@ -25,6 +25,14 @@ if [ "$PROVIDER_READY" -ne 1 ]; then
   exit 1
 fi
 
+# If YOUTUBE_COOKIES_FILE points to a read-only secret (like Render's /etc/secrets),
+# copy it to a writable location so yt-dlp can update session cookies without crashing.
+if [ -n "${YOUTUBE_COOKIES_FILE:-}" ] && [ -f "$YOUTUBE_COOKIES_FILE" ]; then
+  cp "$YOUTUBE_COOKIES_FILE" /tmp/youtube_cookies.txt
+  chmod 600 /tmp/youtube_cookies.txt || true
+  export YOUTUBE_COOKIES_FILE=/tmp/youtube_cookies.txt
+fi
+
 # Trust the proxy's X-Forwarded-For so request.client.host is the real client
 # IP (required for per-IP throttling behind Render's router). Overridable via
 # FORWARDED_ALLOW_IPS if you front this with a stricter proxy setup.
