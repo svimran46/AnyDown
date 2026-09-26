@@ -196,7 +196,7 @@ body {
 }
 
 .fetch-btn:focus-visible, .capture-btn:focus-visible,
-.download-btn-like:focus-visible {
+.download-link:focus-visible, .download-btn-like:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--signal-dim-strong);
 }

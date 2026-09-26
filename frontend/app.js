@@ -104,11 +104,19 @@
       rung.setAttribute("aria-checked", "false");
       rung.tabIndex = idx === 0 ? 0 : -1;
       rung.dataset.formatId = fmt.format_id;
-      rung.dataset.audioOnly = fmt.has_video ? "false" : "true";
+      rung.dataset.audioOnly = fmt.format_id === "audio-only" ? "true" : "false";
 
       const label = document.createElement("span");
       label.className = "rung-label";
-      label.textContent = !fmt.has_video ? "Audio only" : fmt.note || "Video";
+      if (fmt.format_id === "audio-only") {
+        label.textContent = "Audio only (MP3)";
+      } else if (fmt.note) {
+        label.textContent = fmt.note;
+      } else if (!fmt.has_video) {
+        label.textContent = "Audio";
+      } else {
+        label.textContent = "Video";
+      }
 
       const spec = document.createElement("span");
       spec.className = "rung-spec mono";
@@ -227,6 +235,7 @@
         if (consecutiveErrors >= MAX_RETRIES) {
           setTally("failed");
           els.statusText.textContent = err.message;
+          els.downloadBtn.disabled = false;
           return;
         }
         setTally("active");
@@ -251,9 +260,11 @@
         els.statusText.textContent = "Ready.";
         els.downloadLink.href = `/api/file/${encodeURIComponent(jobId)}`;
         els.downloadLink.hidden = false;
+        els.downloadBtn.disabled = false;
       } else if (data.status === "failed") {
         setTally("failed");
         els.statusText.textContent = data.error || "Download failed.";
+        els.downloadBtn.disabled = false;
       }
     };
 
@@ -272,6 +283,7 @@
     els.mediaPanel.hidden = true;
     els.ladderPanel.hidden = true;
     els.statusPanel.hidden = true;
+    els.downloadLink.hidden = true;
     stopPolling();
 
     setFetching(true);
@@ -308,7 +320,7 @@
         has_video: false,
         has_audio: true,
         filesize: null,
-        note: "Audio only",
+        note: "Audio only (MP3)",
       });
       renderLadder(formats);
       els.ladderPanel.hidden = false;
@@ -336,7 +348,6 @@
     } catch (err) {
       setTally("failed");
       els.statusText.textContent = err.message;
-    } finally {
       els.downloadBtn.disabled = false;
     }
   });

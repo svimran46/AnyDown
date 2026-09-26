@@ -33,11 +33,14 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "downloads")
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "5"))
+INFO_THROTTLE_SECONDS = float(os.getenv("INFO_THROTTLE_SECONDS", "1"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-_last_request_at: dict[str, float] = {}
+_last_download_request_at: dict[str, float] = {}
+_last_info_request_at: dict[str, float] = {}
+_background_tasks: set[asyncio.Task] = set()
 
 
 async def _cleanup_loop():
@@ -48,16 +51,20 @@ async def _cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_cleanup_loop())
+    cleanup_task = asyncio.create_task(_cleanup_loop())
     yield
-    task.cancel()
+    cleanup_task.cancel()
     try:
-        await task
+        await cleanup_task
     except asyncio.CancelledError:
         pass
+    if _background_tasks:
+        for t in list(_background_tasks):
+            t.cancel()
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
 
 
-app = FastAPI(title="AnyDown API", version="2.0")
+app = FastAPI(title="AnyDown API", version="2.0", lifespan=lifespan)
 
 # Same-origin is the normal deployment mode. Explicit origins can be supplied
 # if a separate frontend is used.
@@ -159,31 +166,24 @@ async def _validate_public_url(url: str) -> None:
     await _validate_dns(host)
 
 
-def _throttle(client_ip: str) -> None:
+def _get_client_ip(request: Request) -> str:
+    xfwd = request.headers.get("x-forwarded-for")
+    if xfwd:
+        return xfwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _throttle(client_ip: str, table: dict[str, float], delay_seconds: float) -> None:
     now = time.time()
-    previous = _last_request_at.get(client_ip, 0)
-    if now - previous < THROTTLE_SECONDS:
+    previous = table.get(client_ip, 0)
+    if now - previous < delay_seconds:
         raise HTTPException(status_code=429, detail="Too many requests — please slow down.")
-    if len(_last_request_at) >= 1024:
+    if len(table) >= 1024:
         # Bound memory: drop entries old enough that they no longer throttle.
-        for ip, ts in list(_last_request_at.items()):
-            if now - ts >= THROTTLE_SECONDS:
-                del _last_request_at[ip]
-    _last_request_at[client_ip] = now
-
-
-def _job_payload(job):
-    return {
-        "job_id": job.id,
-        "status": job.status,
-        "error": job.error,
-        "filename": job.filename,
-        "progress": job.progress,
-        "downloaded_bytes": job.downloaded_bytes,
-        "total_bytes": job.total_bytes,
-        "speed": job.speed,
-        "eta": job.eta,
-    }
+        for ip, ts in list(table.items()):
+            if now - ts >= delay_seconds:
+                del table[ip]
+    table[client_ip] = now
 
 
 @app.get("/api/health")
@@ -206,37 +206,25 @@ def health():
 
 
 @app.post("/api/info")
-def get_info(payload: InfoRequest):
-    _validate_url_syntax(payload.url)
+async def get_info(payload: InfoRequest, request: Request):
+    await _validate_public_url(payload.url)
+    client_ip = _get_client_ip(request)
+    _throttle(client_ip, _last_info_request_at, INFO_THROTTLE_SECONDS)
     try:
-        return fetch_info(payload.url)
+        return await asyncio.to_thread(fetch_info, payload.url)
     except UnsupportedURLError as exc:
+        raise HTTPException(status_code=400, detail=f"Couldn't read that URL: {exc}") from exc
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Couldn't read that URL: {exc}") from exc
 
 
-@app.post("/api/download")
-async def start_download(payload: DownloadRequest, request: Request):
-    # DNS check runs in a worker thread; never block the event loop here.
-    await _validate_public_url(payload.url)
-    client_ip = request.client.host if request.client else "unknown"
-    _throttle(client_ip)
-
-    if payload.format_id:
-        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-        if not 1 <= len(payload.format_id) <= 100 or any(c not in allowed for c in payload.format_id):
-            raise HTTPException(status_code=400, detail="Invalid format_id.")
-
-    job = job_manager.create_job(payload.url)
-
+async def _execute_download_job(job_id: str, payload: DownloadRequest) -> None:
     async with _download_semaphore:
-        job_manager.update(job.id, status=JobStatus.DOWNLOADING)
+        job_manager.update(job_id, status=JobStatus.DOWNLOADING)
         try:
             def progress(data: dict):
-                # Progress can be None when the total size is unknown; the
-                # frontend already handles that. We intentionally do not
-                # rewrite status here: job status is owned by start_download.
                 job_manager.update(
-                    job.id,
+                    job_id,
                     progress=data.get("percent"),
                     downloaded_bytes=data.get("downloaded_bytes") or 0,
                     total_bytes=data.get("total_bytes") or 0,
@@ -248,37 +236,57 @@ async def start_download(payload: DownloadRequest, request: Request):
                 download_media,
                 payload.url,
                 OUTPUT_DIR,
-                job.id,
+                job_id,
                 payload.format_id,
                 payload.format_has_audio,
                 payload.audio_only,
                 progress,
             )
             job_manager.update(
-                job.id,
+                job_id,
                 status=JobStatus.COMPLETED,
                 filepath=filepath,
                 filename=display_name,
                 progress=100.0,
             )
         except UnsupportedURLError as exc:
-            job_manager.update(job.id, status=JobStatus.FAILED, error=str(exc))
+            job_manager.update(job_id, status=JobStatus.FAILED, error=str(exc))
         except Exception as exc:
             job_manager.update(
-                job.id,
+                job_id,
                 status=JobStatus.FAILED,
                 error=f"Unexpected error: {type(exc).__name__}: {exc}",
             )
+
+
+@app.post("/api/download")
+async def start_download(payload: DownloadRequest, request: Request):
+    # DNS check runs in a worker thread; never block the event loop here.
+    await _validate_public_url(payload.url)
+    client_ip = _get_client_ip(request)
+    _throttle(client_ip, _last_download_request_at, THROTTLE_SECONDS)
+
+    if payload.format_id:
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+        if not 1 <= len(payload.format_id) <= 100 or any(c not in allowed for c in payload.format_id):
+            raise HTTPException(status_code=400, detail="Invalid format_id.")
+
+    job = job_manager.create_job(payload.url)
+
+    # Execute in background task so HTTP response returns immediately with job_id
+    task = asyncio.create_task(_execute_download_job(job.id, payload))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {"job_id": job.id, "status": job.status}
 
 
 @app.get("/api/status/{job_id}")
 def get_status(job_id: str):
-    job = job_manager.get(job_id)
-    if job is None:
+    payload = job_manager.get_payload(job_id)
+    if payload is None:
         raise HTTPException(status_code=404, detail="Job not found (it may have expired).")
-    return _job_payload(job)
+    return payload
 
 
 @app.get("/api/file/{job_id}")

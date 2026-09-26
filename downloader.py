@@ -107,18 +107,16 @@ def _resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Addre
 
 def _socket_connect(
     address: tuple,
-    timeout,
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
     source_address=None,
 ):
-    host, port, *extra = address
+    host = str(address[0])
     try:
-        family = ipaddress.ip_address(host).version
+        ip = ipaddress.ip_address(host)
+        family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
     except ValueError:
-        family = 0
-    sock = socket.socket(
-        socket.AF_INET6 if family == 6 else socket.AF_INET if family == 4 else socket.AF_UNSPEC,
-        socket.SOCK_STREAM,
-    )
+        family = socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
     try:
         if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
             sock.settimeout(timeout)
@@ -133,20 +131,19 @@ def _socket_connect(
 
 def _connect_protected(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
     host = str(address[0])
+    port = address[1] if len(address) > 1 and isinstance(address[1], int) else None
 
-    # 1) Server-configured peers (incl. all loopback names) pass through.
-    if host.lower().rstrip(".") in _config_exempt_hosts():
+    # 1) Server-configured peers pass through on their configured port.
+    if _is_exempt_target(host, port):
         return socket.create_original_connection(address, timeout, source_address)
 
-    # 2) IP literals: validate directly — no DNS involved. Loopback literals
-    #    are covered by the config exemption above.
+    # 2) IP literals: validate directly against SSRF blocklist (never loopback/private).
     try:
         literal_ip = ipaddress.ip_address(host)
     except ValueError:
         literal_ip = None
     if literal_ip is not None:
-        if not literal_ip.is_loopback:
-            _assert_routable(literal_ip)
+        _assert_routable(literal_ip)
         return socket.create_original_connection(address, timeout, source_address)
 
     # 3) Hostnames: atomic resolve-validate-connect per address. Connecting
@@ -164,7 +161,7 @@ def _connect_protected(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_a
 
 
 def _install_ssrf_guard() -> None:
-    """Patch socket.create_connection once (thread-safe, idempotent)."""
+    """Patch socket.create_connection and urllib3 once (thread-safe, idempotent)."""
     global _ssrf_guard_installed
     with _ssrf_guard_lock:
         if _ssrf_guard_installed:
@@ -173,13 +170,22 @@ def _install_ssrf_guard() -> None:
             socket.create_original_connection = socket.create_connection
 
         def guarded_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
-                                      source_address=None):
+                                      source_address=None, **kwargs):
             try:
                 return _connect_protected(address, timeout, source_address)
             except BlockedAddressError as err:
                 raise yt_dlp.utils.DownloadError(str(err)) from err
 
         socket.create_connection = guarded_create_connection
+
+        try:
+            import urllib3.util.connection as urllib3_conn
+            if not hasattr(urllib3_conn, "create_original_connection"):
+                urllib3_conn.create_original_connection = urllib3_conn.create_connection
+                urllib3_conn.create_connection = guarded_create_connection
+        except (ImportError, AttributeError):
+            pass
+
         _ssrf_guard_installed = True
 
 
@@ -211,25 +217,41 @@ APP_VERSION = "2.1.0"
 
 # Loopback peers are always exempt: the bgutil provider runs on 127.0.0.1 in
 # the supported Docker deployment (and the plugin may use that default even
-# when YTDLP_POT_PROVIDER_URL is unset). User-submitted loopback/private URLs
-# are rejected in main.py before yt-dlp ever sees them, so this exemption
-# cannot be reached through the API — only by server-side config peers.
-_LOOPBACK_HOSTS = {"localhost", "localhost.localdomain"}
+def _is_exempt_target(host: str, port: int | None) -> bool:
+    """True if (host, port) matches a server-configured peer (e.g. POT provider, proxy)."""
+    host_clean = host.lower().rstrip(".")
+    for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL):
+        if not url:
+            continue
+        try:
+            parsed = urlparse(url)
+            target_host = (parsed.hostname or "").lower().rstrip(".")
+            if not target_host:
+                continue
+            target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+            is_same_host = (host_clean == target_host)
+            if not is_same_host and target_host in {"127.0.0.1", "localhost", "::1", "localhost.localdomain"}:
+                is_same_host = host_clean in {"127.0.0.1", "localhost", "::1", "localhost.localdomain"}
+
+            if is_same_host and (port is None or port == target_port):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _config_exempt_hosts() -> set[str]:
-    """Hostnames the app is *designed* to reach, from server config only.
-
-    Read from module globals each call so tests can adjust config freely.
-    These never come from user-submitted URLs, so exempting them does not
-    create a user-facing SSRF path.
-    """
-    hosts = set(_LOOPBACK_HOSTS)
+    """Hostnames the app is *designed* to reach, from server config only."""
+    hosts = set()
     for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL):
         if url:
-            host = (urlparse(url).hostname or "").lower().rstrip(".")
-            if host:
-                hosts.add(host)
+            try:
+                host = (urlparse(url).hostname or "").lower().rstrip(".")
+                if host:
+                    hosts.add(host)
+            except Exception:
+                pass
     return hosts
 
 
@@ -305,25 +327,54 @@ def detect_js_runtime() -> str:
 
 def _sanitize_filename(name: str) -> str:
     name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "_", name).strip()
+    name = name.rstrip(". ")
+    base = name.split(".")[0].upper()
+    if base in {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+                "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+                "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}:
+        name = f"_{name}"
     return name[:150] if name else "download"
 
 
 def _find_downloaded_file(output_dir: str, job_id: str, info: dict | None = None) -> str | None:
-    """Find downloaded file by prepare_filename or directory scan fallback."""
+    """Find downloaded file by prepare_filename, metadata attributes, or directory scan fallback."""
+    ignored_exts = (".part", ".ytdl", ".temp", ".tmp", ".aria2")
+
     if info:
+        # 1. Direct filepath attributes yt-dlp may have added
+        for attr in ("filepath", "_filename"):
+            val = info.get(attr)
+            if val and os.path.exists(val) and not val.endswith(ignored_exts):
+                return val
+
+        # 2. requested_downloads list (populated when postprocessors run, e.g. FFmpegExtractAudio)
+        for req in info.get("requested_downloads") or []:
+            if isinstance(req, dict):
+                req_path = req.get("filepath") or req.get("_filename")
+                if req_path and os.path.exists(req_path) and not req_path.endswith(ignored_exts):
+                    return req_path
+
+        # 3. prepare_filename
         try:
             with yt_dlp.YoutubeDL({"outtmpl": os.path.join(output_dir, f"{job_id}.%(ext)s")}) as ydl:
                 prepared_path = ydl.prepare_filename(info)
-                if os.path.exists(prepared_path):
+                if os.path.exists(prepared_path) and not prepared_path.endswith(ignored_exts):
                     return prepared_path
         except Exception:
             pass
 
-    # Fallback: directory scan with preference for base name match
+    # 4. Check common media extensions directly
+    base_prefix = os.path.join(output_dir, job_id)
+    for ext in (".mp4", ".mp3", ".m4a", ".webm", ".mkv", ".opus", ".ogg", ".wav", ".flac", ".aac"):
+        candidate = base_prefix + ext
+        if os.path.exists(candidate):
+            return candidate
+
+    # 5. Fallback: directory scan excluding temporary / partial files
     candidates = []
     expected_base = job_id + "."
     for fname in os.listdir(output_dir):
-        if fname.startswith(expected_base) and not fname.endswith(".part"):
+        if fname.startswith(expected_base) and not fname.endswith(ignored_exts):
             candidates.append(os.path.join(output_dir, fname))
 
     if not candidates:
