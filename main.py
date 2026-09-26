@@ -22,6 +22,7 @@ import database
 from downloader import (
     APP_VERSION,
     MAX_FILESIZE_BYTES,
+    YOUTUBE_PROXY_URL,
     download_media,
     detect_js_runtime,
     fetch_info,
@@ -249,6 +250,7 @@ def health():
         "yt_dlp": yt_dlp.version.__version__,
         "youtube_cookies": cookies,
         "youtube_cookies_configured": cookies["configured"],
+        "youtube_proxy_configured": bool(YOUTUBE_PROXY_URL),
         "pot_provider_configured": pot["configured"],
         "pot_provider_reachable": pot["reachable"],
         "js_runtime": js_runtime or None,

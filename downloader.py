@@ -192,6 +192,7 @@ def _install_ssrf_guard() -> None:
 
 # Secrets/configuration are supplied by the deployment environment.
 FACEBOOK_PROXY_URL = os.getenv("FACEBOOK_PROXY_URL", "").strip()
+YOUTUBE_PROXY_URL = os.getenv("YOUTUBE_PROXY_URL", "").strip()
 YTDLP_POT_PROVIDER_URL = os.getenv("YTDLP_POT_PROVIDER_URL", "").strip()
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
 YTDLP_USER_AGENT = os.getenv(
@@ -221,7 +222,7 @@ APP_VERSION = "2.1.2"
 def _is_exempt_target(host: str, port: int | None) -> bool:
     """True if (host, port) matches a server-configured peer (e.g. POT provider, proxy)."""
     host_clean = host.lower().rstrip(".")
-    for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL):
+    for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL, YOUTUBE_PROXY_URL):
         if not url:
             continue
         try:
@@ -245,7 +246,7 @@ def _is_exempt_target(host: str, port: int | None) -> bool:
 def _config_exempt_hosts() -> set[str]:
     """Hostnames the app is *designed* to reach, from server config only."""
     hosts = set()
-    for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL):
+    for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL, YOUTUBE_PROXY_URL):
         if url:
             try:
                 host = (urlparse(url).hostname or "").lower().rstrip(".")
@@ -629,6 +630,8 @@ def _apply_platform_options(url: str, ydl_opts: dict) -> None:
     if is_youtube(url):
         diagnostic_logger.info(f"[EXTRACTION] YouTube URL detected: {url}")
         _youtube_options(ydl_opts)
+        if YOUTUBE_PROXY_URL:
+            ydl_opts["proxy"] = YOUTUBE_PROXY_URL
     elif is_facebook(url) and FACEBOOK_PROXY_URL:
         ydl_opts["proxy"] = FACEBOOK_PROXY_URL
 
