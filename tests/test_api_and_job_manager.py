@@ -227,6 +227,13 @@ class APITests(unittest.TestCase):
                 job = main.job_manager.get(res["job_id"])
                 self.assertIsNotNone(job)
 
+    def test_get_userscript_endpoint(self):
+        # Verify /anydown.user.js returns the userscript file with application/javascript
+        response = main.get_userscript()
+        self.assertEqual(response.media_type, "application/javascript")
+        self.assertEqual(response.headers.get("content-disposition"), 'inline; filename="anydown.user.js"')
+        self.assertTrue(os.path.exists(response.path))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

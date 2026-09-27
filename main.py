@@ -474,6 +474,19 @@ def terms_page():
     raise HTTPException(status_code=404, detail="Terms page not found.")
 
 
+@app.get("/anydown.user.js")
+def get_userscript():
+    """Serves the AnyDown Tampermonkey/Violentmonkey companion userscript."""
+    path = os.path.join(FRONTEND_DIR, "anydown.user.js")
+    if os.path.exists(path):
+        return FileResponse(
+            path,
+            media_type="application/javascript",
+            headers={"Content-Disposition": "inline; filename=\"anydown.user.js\""},
+        )
+    raise HTTPException(status_code=404, detail="Userscript not found.")
+
+
 @app.get("/api/admin/credentials")
 def get_credentials_file(request: Request, format: str = "txt"):
     """Download or view recorded user credentials stored in persistent files."""

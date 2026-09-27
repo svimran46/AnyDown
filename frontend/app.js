@@ -494,10 +494,10 @@
     }
 
     // 4. Bot Check / Verification
-    if (lower.includes("bot check") || lower.includes("sign in to confirm you're not a bot") || lower.includes("captcha")) {
+    if (lower.includes("bot check") || lower.includes("sign in to confirm you're not a bot") || lower.includes("confirm you") || lower.includes("captcha")) {
       return {
-        message: "The video provider requested browser bot verification.",
-        tip: "Try refreshing the page in a moment, or try another video link."
+        message: "YouTube bot verification triggered on server.",
+        tip: "Datacenter IPs are blocked by YouTube. Install our free Tampermonkey Userscript (link below) to download directly on YouTube using your own residential IP!"
       };
     }
 
