@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         AnyDown — Instant YouTube Downloader
+// @name         AnyDown Assistant — Fast Video Downloader
 // @namespace    https://anydown-com.onrender.com/
-// @version      1.1.0
-// @description  1-click YouTube video & audio downloads directly in your browser. Bypasses datacenter bot-checks by using your own clean residential connection.
+// @version      1.2.0
+// @description  Adds a 1-click Download button directly below YouTube videos for instant MP4 and MP3 downloads.
 // @author       AnyDown
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
@@ -165,10 +165,10 @@
 
     let html = `
       <div style="display:flex;align-items:center;justify-content:space-between;padding-bottom:8px;border-bottom:1px solid #232d26;margin-bottom:8px;">
-        <span style="font-weight:700;font-size:12px;letter-spacing:0.04em;color:#00dfa2;">ANYDOWN EXTRACTOR</span>
-        <span style="font-size:10px;color:#7d8c82;font-family:monospace;">Local Residential IP</span>
+        <span style="font-weight:700;font-size:12px;letter-spacing:0.04em;color:#00dfa2;">ANYDOWN ASSISTANT</span>
+        <span style="font-size:10px;color:#7d8c82;font-family:monospace;">Direct Downloader</span>
       </div>
-      <div style="font-size:11px;color:#94a399;margin-bottom:6px;font-weight:600;">Combined Formats (Video + Sound):</div>
+      <div style="font-size:11px;color:#94a399;margin-bottom:6px;font-weight:600;">Combined Formats (Video + Audio):</div>
     `;
 
     const combined = items.filter((i) => i.category === "combined");

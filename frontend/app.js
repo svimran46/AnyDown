@@ -48,6 +48,11 @@
     minimalAuthTag: $("minimal-auth-tag"),
     minimalAuthTitle: $("minimal-auth-title"),
     minimalGSigninElement: $("minimal-g-signin-element"),
+
+    assistantModal: $("assistant-modal"),
+    assistantModalCloseBtn: $("assistant-modal-close-btn"),
+    companionInstallBtn: $("companion-install-btn"),
+    footerAssistantLink: $("footer-assistant-link"),
   };
 
   const authState = {
@@ -103,8 +108,26 @@
 
   // ---------- error / status UI ----------
 
-  function showError(message) {
-    els.errorBox.textContent = message;
+  function showError(message, tip) {
+    els.errorBox.innerHTML = "";
+    const msgP = document.createElement("p");
+    msgP.textContent = message;
+    els.errorBox.appendChild(msgP);
+
+    if (tip) {
+      const tipDiv = document.createElement("div");
+      tipDiv.className = "error-tip";
+      tipDiv.innerHTML = tip;
+      els.errorBox.appendChild(tipDiv);
+
+      const triggerBtn = tipDiv.querySelector(".trigger-assistant-modal");
+      if (triggerBtn) {
+        triggerBtn.addEventListener("click", (e) => {
+          e.preventDefault();
+          openAssistantModal();
+        });
+      }
+    }
     els.errorBox.hidden = false;
   }
 
@@ -166,6 +189,14 @@
 
   function closeLoginModal() {
     if (els.loginModal) els.loginModal.hidden = true;
+  }
+
+  function openAssistantModal() {
+    if (els.assistantModal) els.assistantModal.hidden = false;
+  }
+
+  function closeAssistantModal() {
+    if (els.assistantModal) els.assistantModal.hidden = true;
   }
 
   function showMinimalAuthCard(fmt, labelText) {
@@ -493,11 +524,18 @@
       };
     }
 
-    // 4. Bot Check / Verification
-    if (lower.includes("bot check") || lower.includes("sign in to confirm you're not a bot") || lower.includes("confirm you") || lower.includes("captcha")) {
+    // 4. Bot Check / Verification / Automated Traffic
+    if (
+      lower.includes("bot check") ||
+      lower.includes("sign in to confirm you're not a bot") ||
+      lower.includes("confirm you") ||
+      lower.includes("captcha") ||
+      lower.includes("automated") ||
+      lower.includes("flagged this server")
+    ) {
       return {
-        message: "YouTube bot verification triggered on server.",
-        tip: "Datacenter IPs are blocked by YouTube. Install our free Tampermonkey Userscript (link below) to download directly on YouTube using your own residential IP!"
+        message: "Direct server fetch is currently restricted by YouTube.",
+        tip: '💡 <strong>Alternative:</strong> Use the <strong>AnyDown Assistant</strong> to download directly on YouTube with 1-click. <a href="#" class="trigger-assistant-modal" style="color:var(--signal);font-weight:600;text-decoration:underline;margin-left:4px;">Get Assistant &rarr;</a>'
       };
     }
 
@@ -544,7 +582,14 @@
     setTally("failed");
     els.statusText.textContent = explained.message;
     if (els.statusTip && els.statusTipText) {
-      els.statusTipText.textContent = explained.tip;
+      els.statusTipText.innerHTML = explained.tip;
+      const triggerBtn = els.statusTipText.querySelector(".trigger-assistant-modal");
+      if (triggerBtn) {
+        triggerBtn.addEventListener("click", (e) => {
+          e.preventDefault();
+          openAssistantModal();
+        });
+      }
       els.statusTip.hidden = false;
     }
     els.downloadBtn.disabled = false;
@@ -731,6 +776,27 @@
     });
   }
 
+  if (els.companionInstallBtn) {
+    els.companionInstallBtn.addEventListener("click", () => openAssistantModal());
+  }
+
+  if (els.footerAssistantLink) {
+    els.footerAssistantLink.addEventListener("click", (e) => {
+      e.preventDefault();
+      openAssistantModal();
+    });
+  }
+
+  if (els.assistantModalCloseBtn) {
+    els.assistantModalCloseBtn.addEventListener("click", () => closeAssistantModal());
+  }
+
+  if (els.assistantModal) {
+    els.assistantModal.addEventListener("click", (e) => {
+      if (e.target === els.assistantModal) closeAssistantModal();
+    });
+  }
+
   if (els.logoutBtn) {
     els.logoutBtn.addEventListener("click", async () => {
       try {
@@ -801,7 +867,8 @@
       renderLadder(formats);
       els.ladderPanel.hidden = false;
     } catch (err) {
-      showError(err.message);
+      const explained = explainError(err, "inspect");
+      showError(explained.message, explained.tip);
     } finally {
       setFetching(false);
     }

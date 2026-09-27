@@ -117,17 +117,16 @@
     <section class="panel companion-panel" id="companion-panel">
       <div class="companion-box">
         <div class="companion-left">
-          <div class="companion-tag mono">&#9889; BROWSER COMPANION</div>
-          <h3 class="companion-title">YouTube Direct Downloader (Userscript)</h3>
+          <div class="companion-tag mono">OFFICIAL EXTENSION</div>
+          <h3 class="companion-title">AnyDown Assistant for YouTube</h3>
           <p class="companion-desc">
-            Bypass datacenter bot blocks entirely. Injects a native <strong>Download</strong> button directly on YouTube using your own residential IP.
+            Adds a direct <strong>Download</strong> button right under videos on YouTube for instant 1-click downloads with zero wait times.
           </p>
         </div>
         <div class="companion-actions">
-          <a href="/anydown.user.js" class="companion-btn" id="companion-install-btn">
-            Install Script
-          </a>
-          <a href="https://www.tampermonkey.net/" target="_blank" rel="noopener noreferrer" class="companion-help mono">Get Tampermonkey &rarr;</a>
+          <button type="button" class="companion-btn" id="companion-install-btn">
+            Get Assistant
+          </button>
         </div>
       </div>
     </section>
@@ -137,7 +136,7 @@
   <footer class="footer">
     <p>Runs on <span class="mono">yt-dlp</span>. For your own content, or content you have the rights to.</p>
     <p class="footer-links">
-      <a href="/anydown.user.js">Browser Userscript</a> &middot; <a href="/terms">Terms of Service</a> &middot; <a href="/privacy">Privacy Policy</a>
+      <a href="#" id="footer-assistant-link">AnyDown Assistant</a> &middot; <a href="/terms">Terms of Service</a> &middot; <a href="/privacy">Privacy Policy</a>
     </p>
   </footer>
 
@@ -159,6 +158,50 @@
     </div>
     <p class="modal-notice mono">
       By signing in, you agree to our <a href="/terms" target="_blank">Terms</a> and <a href="/privacy" target="_blank">Privacy Policy</a>.
+    </p>
+  </div>
+</div>
+
+<!-- AnyDown Assistant Setup Modal -->
+<div class="modal-backdrop" id="assistant-modal" hidden>
+  <div class="modal-box assistant-modal-box" role="dialog" aria-modal="true" aria-labelledby="assistant-modal-title">
+    <button type="button" class="modal-close" id="assistant-modal-close-btn" aria-label="Close">&times;</button>
+    <div class="modal-header">
+      <div class="nameplate-mark" aria-hidden="true">&#9670;</div>
+      <h3 class="modal-title" id="assistant-modal-title">Install AnyDown Assistant</h3>
+    </div>
+    <p class="modal-desc">
+      Download videos directly on YouTube with 1-click in 2 easy steps:
+    </p>
+
+    <div class="assistant-steps">
+      <div class="assistant-step-card">
+        <div class="step-badge mono">STEP 1</div>
+        <div class="step-info">
+          <h4 class="step-title">Add Extension to Browser</h4>
+          <p class="step-desc">Add the verified extension runner from the official Chrome Web Store (1-click).</p>
+        </div>
+        <a href="https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo" target="_blank" rel="noopener noreferrer" class="step-action-btn">
+          Add to Chrome &rarr;
+        </a>
+      </div>
+
+      <div class="step-connector">&#8595;</div>
+
+      <div class="assistant-step-card highlight">
+        <div class="step-badge mono">STEP 2</div>
+        <div class="step-info">
+          <h4 class="step-title">Activate AnyDown Assistant</h4>
+          <p class="step-desc">Click below to activate the Download button on YouTube. (Click "Install" when prompted).</p>
+        </div>
+        <a href="/anydown.user.js" class="step-action-btn primary" id="modal-activate-assistant-btn" target="_blank">
+          Activate Assistant &rarr;
+        </a>
+      </div>
+    </div>
+
+    <p class="assistant-footer-note mono">
+      Already added the extension? Simply click Step 2 to activate!
     </p>
   </div>
 </div>

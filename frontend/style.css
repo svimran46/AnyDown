@@ -854,6 +854,8 @@ body {
   text-decoration: none;
   padding: 8px 16px;
   border-radius: var(--radius-sm);
+  border: none;
+  cursor: pointer;
   transition: background 0.15s ease, transform 0.15s ease;
   white-space: nowrap;
 }
@@ -863,16 +865,119 @@ body {
   transform: translateY(-1px);
 }
 
-.companion-help {
-  font-size: 10.5px;
-  color: var(--text-faint);
-  text-decoration: none;
-  transition: color 0.15s ease;
+/* ---------- assistant setup modal ---------- */
+
+.assistant-modal-box {
+  max-width: 480px;
 }
 
-.companion-help:hover {
-  color: var(--signal);
-  text-decoration: underline;
+.assistant-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 20px 0 16px;
 }
+
+.assistant-step-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  transition: border-color 0.2s ease;
+}
+
+.assistant-step-card.highlight {
+  border-color: rgba(79, 201, 184, 0.4);
+  background: rgba(79, 201, 184, 0.05);
+}
+
+.step-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  background: #111513;
+  border: 1px solid var(--border);
+  padding: 4px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.assistant-step-card.highlight .step-badge {
+  color: var(--signal);
+  border-color: rgba(79, 201, 184, 0.3);
+  background: var(--signal-dim);
+}
+
+.step-info {
+  flex: 1;
+}
+
+.step-title {
+  margin: 0 0 2px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.step-desc {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.step-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.step-action-btn:hover {
+  background: var(--border);
+  border-color: var(--text-muted);
+}
+
+.step-action-btn.primary {
+  background: var(--signal);
+  border-color: var(--signal);
+  color: #08100c;
+  font-weight: 700;
+}
+
+.step-action-btn.primary:hover {
+  background: #6cecdb;
+  border-color: #6cecdb;
+  transform: translateY(-1px);
+}
+
+.step-connector {
+  text-align: center;
+  font-size: 14px;
+  color: var(--text-faint);
+  margin: -4px 0;
+}
+
+.assistant-footer-note {
+  font-size: 11px;
+  color: var(--text-faint);
+  text-align: center;
+  margin: 12px 0 0;
+}
+
 
 
