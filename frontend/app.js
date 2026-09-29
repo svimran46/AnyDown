@@ -1,5 +1,7 @@
-// CAPTURE — frontend logic with Google Authentication & Quality Gating.
-// Talks to the same-origin API: /api/config, /api/auth/*, /api/media/inspect, /api/download, /api/status/:id, /api/file/:id
+// CAPTURE — frontend logic. No account system and no quality gate: every
+// format the server offers is downloadable.
+// Talks to the same-origin API: /api/config, /api/media/inspect, /api/download,
+// /api/status/:id, /api/file/:id
 
 (() => {
   "use strict";
@@ -29,25 +31,8 @@
     statusText: $("status-text"),
     downloadLink: $("download-link"),
 
-    authBar: $("auth-bar"),
-    loginTriggerBtn: $("login-trigger-btn"),
-    userBadge: $("user-badge"),
-    userAvatar: $("user-avatar"),
-    userName: $("user-name"),
-    logoutBtn: $("logout-btn"),
-
-    loginModal: $("login-modal"),
-    modalCloseBtn: $("modal-close-btn"),
-    modalDesc: $("modal-desc"),
-    gSigninElement: $("g-signin-element"),
-
     statusTip: $("status-tip"),
     statusTipText: $("status-tip-text"),
-
-    minimalAuthCard: $("minimal-auth-card"),
-    minimalAuthTag: $("minimal-auth-tag"),
-    minimalAuthTitle: $("minimal-auth-title"),
-    minimalGSigninElement: $("minimal-g-signin-element"),
 
     assistantModal: $("assistant-modal"),
     assistantModalCloseBtn: $("assistant-modal-close-btn"),
@@ -55,20 +40,10 @@
     footerAssistantLink: $("footer-assistant-link"),
   };
 
-  const authState = {
-    authenticated: false,
-    user: null,
-    googleClientId: null,
-    guestMaxHeight: 720,
-    pendingDownload: null, // { url, formatId, isAudioOnly }
-    gisInitialized: false,
-  };
-
   const state = {
     formats: [],
     selectedFormatId: null,
     selectedIsAudioOnly: false,
-    selectedIsLocked: false,
     pollHandle: null,
   };
 
@@ -142,55 +117,6 @@
     els.fetchBtn.querySelector(".btn-label").textContent = isFetching ? "Fetching…" : "Fetch";
   }
 
-  // ---------- auth UI management ----------
-
-  function setAuthenticatedUser(user) {
-    authState.authenticated = true;
-    authState.user = user;
-
-    if (els.loginTriggerBtn) els.loginTriggerBtn.hidden = true;
-    if (els.userBadge) els.userBadge.hidden = false;
-    if (els.userName) els.userName.textContent = user.name || (user.email ? user.email.split("@")[0] : "User");
-    if (els.userAvatar) {
-      if (user.avatarUrl) {
-        els.userAvatar.src = user.avatarUrl;
-        els.userAvatar.hidden = false;
-      } else {
-        els.userAvatar.hidden = true;
-      }
-    }
-    if (els.ladderHint) {
-      els.ladderHint.textContent = "All qualities unlocked";
-    }
-  }
-
-  function setGuestUser() {
-    authState.authenticated = false;
-    authState.user = null;
-
-    if (els.loginTriggerBtn) els.loginTriggerBtn.hidden = false;
-    if (els.userBadge) els.userBadge.hidden = true;
-    if (els.userAvatar) els.userAvatar.removeAttribute("src");
-    if (els.userName) els.userName.textContent = "";
-    if (els.ladderHint) {
-      els.ladderHint.textContent = `> ${authState.guestMaxHeight}p requires sign in`;
-    }
-  }
-
-  function openLoginModal(desc) {
-    if (desc && els.modalDesc) {
-      els.modalDesc.textContent = desc;
-    } else if (els.modalDesc) {
-      els.modalDesc.textContent = `Sign in with Google to unlock 1080p, 1440p, 4K, and high-bitrate video downloads.`;
-    }
-    if (els.loginModal) els.loginModal.hidden = false;
-    renderGoogleButton();
-  }
-
-  function closeLoginModal() {
-    if (els.loginModal) els.loginModal.hidden = true;
-  }
-
   function openAssistantModal() {
     if (els.assistantModal) els.assistantModal.hidden = false;
   }
@@ -199,174 +125,7 @@
     if (els.assistantModal) els.assistantModal.hidden = true;
   }
 
-  function showMinimalAuthCard(fmt, labelText) {
-    if (!els.minimalAuthCard || authState.authenticated) return;
-    const res = fmt ? (fmt.resolution || (fmt.height ? `${fmt.height}p` : fmt.note || labelText || "HD")) : (labelText || "HD");
-    if (els.minimalAuthTag) els.minimalAuthTag.textContent = `Quality Gate: ${res}`;
-    if (els.minimalAuthTitle) els.minimalAuthTitle.textContent = `Sign in with Google to download in ${res}`;
-    els.minimalAuthCard.hidden = false;
-    renderGoogleButtons();
-  }
-
-  function hideMinimalAuthCard() {
-    if (els.minimalAuthCard) {
-      els.minimalAuthCard.hidden = true;
-    }
-  }
-
-  function renderGoogleButtons() {
-    if (!window.google || !window.google.accounts || !window.google.accounts.id) return;
-
-    if (els.gSigninElement) {
-      els.gSigninElement.innerHTML = "";
-      try {
-        google.accounts.id.renderButton(els.gSigninElement, {
-          type: "standard",
-          theme: "filled_black",
-          size: "large",
-          text: "signin_with",
-          shape: "rectangular",
-          logo_alignment: "left",
-          width: 280,
-        });
-      } catch (e) {
-        console.warn("Could not render modal Google button", e);
-      }
-    }
-
-    if (els.minimalGSigninElement) {
-      els.minimalGSigninElement.innerHTML = "";
-      try {
-        google.accounts.id.renderButton(els.minimalGSigninElement, {
-          type: "standard",
-          theme: "filled_blue",
-          size: "large",
-          text: "signin_with",
-          shape: "rectangular",
-          logo_alignment: "left",
-          width: 260,
-        });
-      } catch (e) {
-        console.warn("Could not render inline Google button", e);
-      }
-    }
-  }
-
-  function setupGoogleIdentityServices() {
-    if (!window.google || !window.google.accounts || !window.google.accounts.id) {
-      setTimeout(setupGoogleIdentityServices, 250);
-      return;
-    }
-    if (authState.gisInitialized || !authState.googleClientId) return;
-
-    google.accounts.id.initialize({
-      client_id: authState.googleClientId,
-      callback: handleGoogleCredentialResponse,
-      auto_select: false,
-      cancel_on_tap_outside: true,
-    });
-    authState.gisInitialized = true;
-    renderGoogleButtons();
-  }
-
-  async function handleGoogleCredentialResponse(googleResponse) {
-    if (!googleResponse || !googleResponse.credential) return;
-
-    try {
-      const res = await fetch("/api/auth/google", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ credential: googleResponse.credential }),
-      });
-      const data = await parseResponse(res, "Sign in failed.");
-      if (data.authenticated && data.user) {
-        setAuthenticatedUser(data.user);
-        hideMinimalAuthCard();
-        closeLoginModal();
-
-        // Refresh ladder rungs to unlock qualities
-        if (state.formats.length > 0) {
-          renderLadder(state.formats);
-        }
-
-        // Automatic resume of requested download
-        if (authState.pendingDownload) {
-          const pending = authState.pendingDownload;
-          authState.pendingDownload = null;
-          resumePendingDownload(pending);
-        }
-      }
-    } catch (err) {
-      showError(err.message);
-    }
-  }
-
-  async function resumePendingDownload(pending) {
-    if (!pending || !pending.url || !pending.formatId) return;
-
-    // Find and select the corresponding rung
-    const targetRung = Array.from(els.ladderList.querySelectorAll(".rung")).find(
-      (r) => r.dataset.formatId === pending.formatId
-    );
-    if (targetRung) {
-      selectRung(targetRung);
-    }
-
-    clearError();
-    els.downloadBtn.disabled = true;
-    els.statusPanel.hidden = false;
-    els.downloadLink.hidden = true;
-    setTally("active");
-    els.statusText.textContent = "Starting download…";
-
-    try {
-      const job = await startDownload(pending.url, pending.formatId, pending.isAudioOnly);
-      pollStatus(job.job_id);
-    } catch (err) {
-      setTally("failed");
-      els.statusText.textContent = err.message;
-      els.downloadBtn.disabled = false;
-    }
-  }
-
-  async function initAuth() {
-    try {
-      const cfgRes = await fetch("/api/config");
-      if (cfgRes.ok) {
-        const cfg = await cfgRes.json();
-        authState.googleClientId = cfg.google_client_id;
-        authState.guestMaxHeight = cfg.guest_max_height || 720;
-      }
-    } catch (e) {
-      console.warn("Could not load /api/config", e);
-    }
-
-    try {
-      const meRes = await fetch("/api/auth/me");
-      if (meRes.ok) {
-        const meData = await meRes.json();
-        if (meData.authenticated && meData.user) {
-          setAuthenticatedUser(meData.user);
-        } else {
-          setGuestUser();
-        }
-      } else {
-        setGuestUser();
-      }
-    } catch (e) {
-      setGuestUser();
-    }
-
-    setupGoogleIdentityServices();
-  }
-
   // ---------- ladder rendering ----------
-
-  function isFormatLocked(fmt) {
-    if (authState.authenticated) return false;
-    if (fmt.locked !== undefined) return fmt.locked;
-    return !!(fmt.height && fmt.height > authState.guestMaxHeight);
-  }
 
   function renderLadder(formats) {
     state.formats = formats;
@@ -384,12 +143,6 @@
       rung.dataset.formatId = fmt.format_id;
       rung.dataset.audioOnly = fmt.format_id === "audio-only" ? "true" : "false";
 
-      const locked = isFormatLocked(fmt);
-      if (locked) {
-        rung.classList.add("locked");
-        rung.dataset.locked = "true";
-      }
-
       const label = document.createElement("span");
       label.className = "rung-label";
 
@@ -406,13 +159,6 @@
       const rightContainer = document.createElement("span");
       rightContainer.className = "rung-right";
 
-      if (locked) {
-        const lockBadge = document.createElement("span");
-        lockBadge.className = "rung-lock-badge";
-        lockBadge.innerHTML = "&#128274; Sign in to unlock";
-        rightContainer.appendChild(lockBadge);
-      }
-
       const spec = document.createElement("span");
       spec.className = "rung-spec mono";
       spec.textContent = formatSpec(fmt);
@@ -420,24 +166,7 @@
 
       rung.append(label, rightContainer);
 
-      rung.addEventListener("click", () => {
-        selectRung(rung);
-
-        if (rung.dataset.locked === "true") {
-          // Unauthenticated user clicked locked format (>720p):
-          // 1. Record pending download
-          authState.pendingDownload = {
-            url: els.urlInput.value.trim(),
-            formatId: fmt.format_id,
-            isAudioOnly: fmt.format_id === "audio-only",
-          };
-          // 2. Open the minimalistic sign-in box directly under the ladder!
-          showMinimalAuthCard(fmt, textLabel);
-        } else {
-          // Unlocked format (<= 720p or audio): hide minimal auth box
-          hideMinimalAuthCard();
-        }
-      });
+      rung.addEventListener("click", () => selectRung(rung));
 
       rung.addEventListener("keydown", (e) => handleRungKeydown(e, rung));
 
@@ -456,15 +185,7 @@
 
     state.selectedFormatId = rung.dataset.formatId;
     state.selectedIsAudioOnly = rung.dataset.audioOnly === "true";
-    state.selectedIsLocked = rung.dataset.locked === "true";
     els.downloadBtn.disabled = false;
-
-    const labelSpan = els.downloadBtn.querySelector(".btn-label");
-    if (labelSpan) {
-      labelSpan.textContent = (state.selectedIsLocked && !authState.authenticated)
-        ? "Sign in with Google to Download"
-        : "Download";
-    }
   }
 
   function handleRungKeydown(e, rung) {
@@ -508,15 +229,7 @@
       };
     }
 
-    // 2. Quality Gate / Login Required (401)
-    if (rawError?.code === "LOGIN_REQUIRED" || lower.includes("sign in with google") || rawError?.status === 401) {
-      return {
-        message: msg,
-        tip: tip || "Sign in with your Google account to unlock 1080p, 1440p, and 4K downloads instantly."
-      };
-    }
-
-    // 3. Format / Audio / Video stream missing
+    // 2. Format / Audio / Video stream missing
     if (lower.includes("requested format") || lower.includes("invalid format") || lower.includes("format not available")) {
       return {
         message: "This specific stream or resolution is no longer provided by the host.",
@@ -524,7 +237,7 @@
       };
     }
 
-    // 4. Bot Check / Verification / Automated Traffic
+    // 3. Bot Check / Verification / Automated Traffic
     if (
       lower.includes("bot check") ||
       lower.includes("sign in to confirm you're not a bot") ||
@@ -539,7 +252,7 @@
       };
     }
 
-    // 5. File size cap exceeded
+    // 4. File size cap exceeded
     if (lower.includes("larger than max-filesize") || lower.includes("size limit")) {
       return {
         message: msg,
@@ -547,7 +260,7 @@
       };
     }
 
-    // 6. Network timeout / Gateway error (502 / 504)
+    // 5. Network timeout / Gateway error (502 / 504)
     if (lower.includes("504") || lower.includes("gateway timeout") || lower.includes("timed out")) {
       return {
         message: "The connection to the video provider timed out.",
@@ -562,7 +275,7 @@
       };
     }
 
-    // 7. Private / Copyright / Geo-blocked
+    // 6. Private / Copyright / Geo-blocked
     if (lower.includes("private video") || lower.includes("copyright") || lower.includes("geo-restricted") || lower.includes("blocked")) {
       return {
         message: "This video is restricted by the content creator or copyright holder.",
@@ -570,7 +283,7 @@
       };
     }
 
-    // 8. General fallback
+    // 7. General fallback
     return {
       message: msg,
       tip: tip || (context === "download" ? "Try selecting a different resolution above, or retry in a few moments." : "Check that the URL is public and valid, then try again.")
@@ -628,15 +341,6 @@
     }
 
     if (!res.ok) {
-      if (res.status === 401 && (data?.error === "LOGIN_REQUIRED" || data?.detail === "LOGIN_REQUIRED")) {
-        const err = new Error(data?.message || data?.detail || fallbackMessage);
-        err.code = "LOGIN_REQUIRED";
-        err.status = 401;
-        err.requiredHeight = data?.requiredHeight;
-        err.tip = data?.tip || "Sign in with Google to download videos above 720p.";
-        throw err;
-      }
-
       // Handle FastAPI 422 validation error array
       let detailMsg = "";
       if (Array.isArray(data?.detail)) {
@@ -762,20 +466,6 @@
 
   // ---------- event wiring ----------
 
-  if (els.loginTriggerBtn) {
-    els.loginTriggerBtn.addEventListener("click", () => openLoginModal());
-  }
-
-  if (els.modalCloseBtn) {
-    els.modalCloseBtn.addEventListener("click", () => closeLoginModal());
-  }
-
-  if (els.loginModal) {
-    els.loginModal.addEventListener("click", (e) => {
-      if (e.target === els.loginModal) closeLoginModal();
-    });
-  }
-
   if (els.companionInstallBtn) {
     els.companionInstallBtn.addEventListener("click", () => openAssistantModal());
   }
@@ -797,27 +487,10 @@
     });
   }
 
-  if (els.logoutBtn) {
-    els.logoutBtn.addEventListener("click", async () => {
-      try {
-        await fetch("/api/auth/logout", { method: "POST" });
-        setGuestUser();
-        hideMinimalAuthCard();
-        // Re-render ladder to reflect locked high-resolution rungs
-        if (state.formats.length > 0) {
-          renderLadder(state.formats);
-        }
-      } catch (err) {
-        console.error("Logout failed:", err);
-      }
-    });
-  }
-
   els.form.addEventListener("submit", async (e) => {
     e.preventDefault();
     clearError();
     clearStatusTip();
-    hideMinimalAuthCard();
 
     const url = els.urlInput.value.trim();
     if (!url) return;
@@ -862,7 +535,6 @@
         has_audio: true,
         filesize: null,
         note: "Audio only (MP3)",
-        locked: false,
       });
       renderLadder(formats);
       els.ladderPanel.hidden = false;
@@ -879,22 +551,6 @@
     clearError();
     clearStatusTip();
 
-    // If selected format is locked (> 720p) and user is a guest:
-    if (state.selectedIsLocked && !authState.authenticated) {
-      authState.pendingDownload = {
-        url: els.urlInput.value.trim(),
-        formatId: state.selectedFormatId,
-        isAudioOnly: state.selectedIsAudioOnly,
-      };
-      if (els.minimalAuthCard) {
-        els.minimalAuthCard.hidden = false;
-        renderGoogleButtons();
-        els.minimalAuthCard.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      }
-      openLoginModal(`Sign in with Google to download in full HD.`);
-      return;
-    }
-
     els.downloadBtn.disabled = true;
     els.statusPanel.hidden = false;
     els.downloadLink.hidden = true;
@@ -906,26 +562,7 @@
       const job = await startDownload(url, state.selectedFormatId, state.selectedIsAudioOnly);
       pollStatus(job.job_id);
     } catch (err) {
-      if (err.code === "LOGIN_REQUIRED") {
-        setTally(null);
-        els.statusPanel.hidden = true;
-        els.downloadBtn.disabled = false;
-        authState.pendingDownload = {
-          url: els.urlInput.value.trim(),
-          formatId: state.selectedFormatId,
-          isAudioOnly: state.selectedIsAudioOnly,
-        };
-        if (els.minimalAuthCard) {
-          els.minimalAuthCard.hidden = false;
-          renderGoogleButtons();
-        }
-        openLoginModal(err.message);
-        return;
-      }
       showStatusError(err, "download");
     }
   });
-
-  // Initialize authentication on page load
-  initAuth();
 })();

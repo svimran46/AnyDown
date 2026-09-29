@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import ipaddress
-import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import yt_dlp
-import auth
 import authorization
 import database
 from downloader import (
@@ -41,14 +38,12 @@ FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "5"))
 INFO_THROTTLE_SECONDS = float(os.getenv("INFO_THROTTLE_SECONDS", "1"))
-AUTH_THROTTLE_SECONDS = float(os.getenv("AUTH_THROTTLE_SECONDS", "2"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 _last_download_request_at: dict[str, float] = {}
 _last_info_request_at: dict[str, float] = {}
-_last_auth_request_at: dict[str, float] = {}
 _background_tasks: set[asyncio.Task] = set()
 
 # Short-lived in-memory metadata cache so /api/download does not duplicate yt-dlp extraction
@@ -192,10 +187,6 @@ class DownloadRequest(BaseModel):
     height: int | None = Field(default=None, ge=0, le=10000)
 
 
-class GoogleAuthRequest(BaseModel):
-    credential: str = Field(min_length=10, max_length=8192)
-
-
 def _validate_url_syntax(url: str) -> str:
     """Cheap, DNS-free URL checks. Returns the validated hostname.
 
@@ -326,12 +317,8 @@ def _throttle(client_ip: str, table: dict[str, float], delay_seconds: float) -> 
 
 @app.get("/api/config")
 def get_public_config():
-    """Expose non-sensitive client configuration for Google Sign-In and feature gates."""
+    """Expose non-sensitive client configuration."""
     return {
-        "google_client_id": auth.GOOGLE_CLIENT_ID,
-        "googleClientId": auth.GOOGLE_CLIENT_ID,
-        "guest_max_height": authorization.GUEST_MAX_HEIGHT,
-        "guestMaxHeight": authorization.GUEST_MAX_HEIGHT,
         "app_base_url": os.getenv("APP_BASE_URL", "").strip(),
     }
 
@@ -360,49 +347,8 @@ def health():
 
 
 # --------------------------------------------------------------------------
-# Authentication endpoints
+# Media Inspection & Format Verification
 # --------------------------------------------------------------------------
-
-@app.post("/api/auth/google")
-async def auth_google(payload: GoogleAuthRequest, request: Request, response: Response):
-    client_ip = _get_client_ip(request)
-    _throttle(client_ip, _last_auth_request_at, AUTH_THROTTLE_SECONDS)
-    # authenticate_google_user verifies a Google JWT over the network and does
-    # two DB writes; run it off the event loop.
-    return await asyncio.to_thread(
-        auth.authenticate_google_user, payload.credential, request, response
-    )
-
-
-@app.get("/api/auth/me")
-def auth_me(request: Request):
-    user = auth.get_current_user(request)
-    if not user:
-        return {"authenticated": False, "user": None}
-    return {
-        "authenticated": True,
-        "user": {
-            "id": str(user["id"]),
-            "email": user["email"],
-            "name": user.get("name"),
-            "avatarUrl": user.get("avatar_url"),
-        },
-    }
-
-
-@app.post("/api/auth/logout")
-def auth_logout(request: Request, response: Response):
-    return auth.logout_user(request, response)
-
-
-# --------------------------------------------------------------------------
-# Media Inspection & Quality Gating
-# --------------------------------------------------------------------------
-
-async def _get_current_user_async(request: Request):
-    """Session lookup off the event loop (it opens a DB connection)."""
-    return await asyncio.to_thread(auth.get_current_user, request)
-
 
 async def _inspect_media_core(url: str, request: Request) -> dict:
     client_ip = _get_client_ip(request)
@@ -421,8 +367,7 @@ async def _inspect_media_core(url: str, request: Request) -> dict:
             status_code=400, detail="Couldn't read that URL. Please try again."
         ) from exc
 
-    current_user = await _get_current_user_async(request)
-    annotated_formats = authorization.annotate_formats_with_locks(info.get("formats", []), current_user)
+    annotated_formats = authorization.annotate_formats(info.get("formats", []))
 
     result = dict(info)
     result["formats"] = annotated_formats
@@ -497,24 +442,24 @@ async def _execute_download_job(
             )
 
 
-async def _resolve_and_authorize(
-    payload: DownloadRequest, current_user: dict | None
+async def _resolve_format_request(
+    payload: DownloadRequest,
 ) -> tuple[int | None, bool]:
     """Verify a download request against the server's own extraction.
 
-    Returns ``(max_height, format_has_audio)`` for an allowed request, where
-    ``max_height`` is the server-verified resolution cap that the downloader
-    must not exceed (None means audio-only / no cap).
+    Returns ``(max_height, format_has_audio)`` for a verified request, where
+    ``max_height`` is the verified height of the chosen format (None for
+    audio-only).
 
-    Raises HTTPException for anything the server cannot verify. The
-    client-supplied ``height`` field is never consulted: trusting it (or
-    defaulting to None when a format cannot be resolved) is what allowed a
-    guest to obtain 1080p/4K by omitting ``format_id``.
+    This is verification, not permission. It guarantees the client gets exactly
+    the format_id it asked for and cannot substitute one: the client-supplied
+    ``height`` field is ignored entirely, and a format_id that does not appear
+    in the server's own extraction is rejected rather than silently replaced by
+    yt-dlp's idea of "best".
     """
     if payload.audio_only:
-        # Audio-only is free for everyone, but still require that the server
-        # can actually see the media, so a bogus URL fails here rather than
-        # deep inside the download worker.
+        # Still require the server can see the media, so a bogus URL fails here
+        # rather than deep inside the download worker.
         await _get_or_fetch_info(payload.url)
         return None, True
 
@@ -550,30 +495,16 @@ async def _resolve_and_authorize(
         return None, True
 
     if verdict.height is None:
-        # A video format with no declared height cannot be gated. Fail closed.
+        # A video format with no declared height cannot be verified.
         raise HTTPException(
             status_code=400,
             detail="That quality could not be verified. Please choose another resolution.",
         )
 
-    if not authorization.can_download_format(current_user, verdict.height):
+    if not authorization.can_download_format(verdict.height):
         raise HTTPException(
-            status_code=401,
-            detail=json.dumps(
-                {
-                    "error": "LOGIN_REQUIRED",
-                    "message": (
-                        f"Sign in with Google to download videos above "
-                        f"{authorization.GUEST_MAX_HEIGHT}p."
-                    ),
-                    "tip": (
-                        f"Qualities above {authorization.GUEST_MAX_HEIGHT}p require a free sign in. "
-                        "Sign in with Google to unlock full HD & 4K."
-                    ),
-                    "requiredHeight": verdict.height,
-                }
-            ),
-            headers={"X-Required-Height": str(verdict.height)},
+            status_code=400,
+            detail="That quality could not be verified. Please choose another resolution.",
         )
 
     return verdict.height, verdict.has_audio
@@ -591,34 +522,20 @@ async def start_download(payload: DownloadRequest, request: Request):
         if not 1 <= len(payload.format_id) <= 100 or any(c not in allowed for c in payload.format_id):
             raise HTTPException(status_code=400, detail="Invalid format_id.")
 
-    # 1. Authenticate user from session cookie
-    current_user = await _get_current_user_async(request)
-
-    # 2/3. Server verifies the format and enforces the quality gate.
+    # Server verifies the requested format against its own extraction.
     try:
-        max_height, format_has_audio = await _resolve_and_authorize(payload, current_user)
+        max_height, format_has_audio = await _resolve_format_request(payload)
     except HTTPException as exc:
-        # The gate answers with a JSON body describing the failure so the
-        # frontend can distinguish "sign in" from "pick another quality".
-        detail = exc.detail
-        if isinstance(detail, str) and detail.startswith("{"):
-            try:
-                content = json.loads(detail)
-            except json.JSONDecodeError:
-                content = {"error": "REQUEST_REJECTED", "message": detail}
-        else:
-            content = {"error": "REQUEST_REJECTED", "message": str(detail)}
-        if exc.status_code == 401:
-            content.setdefault("code", "LOGIN_REQUIRED")
-        return JSONResponse(status_code=exc.status_code, content=content)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "REQUEST_REJECTED", "message": str(exc.detail)},
+        )
 
-    # 4. Record download event (off the event loop: it opens a DB connection)
+    # Record download event (off the event loop: it opens a DB connection)
     await asyncio.to_thread(
         database.record_download_event,
-        user_id=str(current_user["id"]) if current_user else None,
         provider=urlparse(payload.url).hostname,
         requested_height=max_height,
-        authenticated=current_user is not None,
         status="queued",
     )
 
@@ -679,38 +596,6 @@ def get_userscript():
             headers={"Content-Disposition": "inline; filename=\"anydown.user.js\""},
         )
     raise HTTPException(status_code=404, detail="Userscript not found.")
-
-
-@app.get("/api/admin/credentials")
-def get_credentials_file(request: Request, fmt: str = "txt"):
-    """Download recorded sign-in credentials. Requires ADMIN_KEY to be set.
-
-    This endpoint exposes every sign-in's email, name, Google subject ID, IP
-    address and user agent, so it fails CLOSED: if ADMIN_KEY is not configured
-    there is no way to authenticate and the request is refused rather than
-    served to the world.
-    """
-    admin_key = os.getenv("ADMIN_KEY", "").strip()
-    if not admin_key:
-        logger.error(
-            "Refusing /api/admin/credentials: ADMIN_KEY is not configured. "
-            "Set ADMIN_KEY to a secret value to enable this endpoint."
-        )
-        raise HTTPException(
-            status_code=503,
-            detail="Credential export is disabled because ADMIN_KEY is not configured.",
-        )
-
-    token = request.headers.get("x-admin-key", "")
-    if not token or not hmac.compare_digest(token, admin_key):
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
-    file_path = auth.CREDENTIALS_JSONL if fmt.lower() == "json" else auth.CREDENTIALS_TXT
-    if not os.path.exists(file_path):
-        return PlainTextResponse("No user credentials recorded in file yet.", status_code=200)
-
-    filename = os.path.basename(file_path)
-    return FileResponse(file_path, media_type="text/plain", filename=filename)
 
 
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

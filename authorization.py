@@ -1,13 +1,16 @@
-"""Centralized download authorization and quality access policy."""
+"""Server-side verification of requested download formats.
+
+There is no account system and no quality gate: every caller may download any
+format the source actually offers. What remains here is verification, not
+permission -- the server resolves a requested format_id against its own
+yt-dlp extraction so a client cannot invent a quality or smuggle in a
+format_id that does not exist.
+"""
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any
-
-# Maximum video height accessible to unauthenticated guests (default 720p).
-GUEST_MAX_HEIGHT = int(os.getenv("GUEST_MAX_HEIGHT", "720"))
 
 
 def format_is_audio_only(fmt: dict[str, Any]) -> bool:
@@ -26,36 +29,35 @@ def format_is_audio_only(fmt: dict[str, Any]) -> bool:
     return fmt.get("height") is None
 
 
-def can_download_format(user: dict[str, Any] | None, height: int | None, audio_only: bool = False) -> bool:
-    """Centralized download access policy.
+def can_download_format(height: int | None, audio_only: bool = False) -> bool:
+    """True when this resolution is servable.
 
-    - Audio-only downloads: ALLOWED for everyone.
-    - Video with a known height <= GUEST_MAX_HEIGHT: ALLOWED for everyone.
-    - Video with a known height > GUEST_MAX_HEIGHT: LOGIN REQUIRED.
-    - Video with an *unknown* height: DENIED. The gate fails closed, because
-      guessing "allow" here is what let a client bypass the gate by omitting
-      ``format_id`` and letting yt-dlp fall back to its best format.
+    No quality ceiling and no accounts, so the only rejections are ones where
+    the server cannot verify what it would be downloading: an *unknown* height
+    for a video format. Failing closed there is what stops a client from
+    omitting ``format_id`` and letting yt-dlp silently resolve to its best
+    format, which is not what was asked for.
+
+    Audio-only is always allowed; it carries no height to verify.
     """
     if audio_only:
         return True
-    if height is None:
-        return False
-    if height <= GUEST_MAX_HEIGHT:
-        return True
-    return user is not None
+    return height is not None
 
 
-def annotate_formats_with_locks(formats: list[dict[str, Any]], user: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Annotate format dictionary items with a 'locked' boolean based on user authentication."""
+def annotate_formats(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return copies of the formats with a 'locked' flag for the client UI.
+
+    Nothing is ever locked now, so the flag is always False. It is kept so the
+    frontend's format rendering does not need to change shape.
+    """
     annotated: list[dict[str, Any]] = []
     for fmt in formats:
         item = dict(fmt)
         audio_only = format_is_audio_only(fmt)
         height = item.get("height")
-        # Audio-only formats have no height; ask the gate about the video height
-        # only when the format actually is a video.
         item["locked"] = not can_download_format(
-            user, None if audio_only else height, audio_only=audio_only
+            None if audio_only else height, audio_only=audio_only
         )
         annotated.append(item)
     return annotated
@@ -67,8 +69,8 @@ class FormatVerdict:
 
     ``known`` is False when the requested ``format_id`` does not appear in the
     server's own yt-dlp extraction. Callers must treat that as a rejection:
-    falling back to a client-supplied height (or to no format at all) is
-    exactly how the quality gate used to be bypassed.
+    falling back to "just give me your best" would silently return something
+    other than what was asked for.
     """
 
     known: bool
@@ -94,9 +96,8 @@ def resolve_format(
 ) -> FormatVerdict:
     """Find the true, server-verified shape of a requested format.
 
-    Clients cannot bypass the quality gate by supplying a fake height or by
-    requesting a format that does not exist: the server resolves the request
-    against yt-dlp's extracted formats and reports what it actually found.
+    Clients cannot request a quality that does not exist: the server resolves
+    the request against yt-dlp's extracted formats and reports what it found.
     """
     if audio_only:
         return FormatVerdict(

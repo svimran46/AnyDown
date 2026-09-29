@@ -484,76 +484,6 @@ body {
   gap: 16px;
 }
 
-.auth-bar {
-  display: flex;
-  align-items: center;
-}
-
-.auth-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: var(--surface-raised);
-  border: 1px solid var(--border);
-  color: var(--text);
-  padding: 6px 12px;
-  border-radius: var(--radius-sm);
-  font-size: 12px;
-  font-family: var(--font-body);
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.auth-btn:hover {
-  border-color: var(--signal);
-  color: var(--signal);
-}
-
-.google-icon {
-  display: block;
-}
-
-.user-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.user-avatar {
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  border: 1px solid var(--border);
-  object-fit: cover;
-}
-
-.user-name {
-  font-size: 12px;
-  color: var(--text);
-  max-width: 120px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.logout-btn {
-  background: transparent;
-  border: 1px solid var(--border-soft);
-  color: var(--text-muted);
-  font-size: 11px;
-  font-family: var(--font-mono);
-  padding: 3px 8px;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.logout-btn:hover {
-  border-color: var(--error);
-  color: var(--error);
-}
-
 /* ---------- locked rungs ---------- */
 
 .ladder-header {
@@ -569,98 +499,10 @@ body {
   font-family: var(--font-mono);
 }
 
-.rung.locked {
-  cursor: pointer;
-}
-
-.rung.locked .rung-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.rung-lock-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  font-family: var(--font-mono);
-  color: var(--tally);
-  background: var(--tally-dim);
-  border: 1px solid rgba(232, 163, 61, 0.35);
-  padding: 2px 7px;
-  border-radius: 4px;
-}
-
 .rung-right {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-/* ---------- minimal auth box ---------- */
-
-.minimal-auth-card {
-  margin: 14px 0 16px;
-  padding: 16px 18px;
-  background: rgba(30, 41, 59, 0.45);
-  border: 1px solid rgba(66, 133, 244, 0.35);
-  border-radius: var(--radius-sm);
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
-  animation: rise 0.25s ease both;
-}
-
-.minimal-auth-card[hidden] {
-  display: none !important;
-}
-
-.minimal-auth-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-
-.minimal-auth-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: rgba(66, 133, 244, 0.12);
-  border: 1px solid rgba(66, 133, 244, 0.28);
-  padding: 3px 8px;
-  border-radius: 4px;
-  font-size: 11px;
-  color: #8ab4f8;
-}
-
-.minimal-auth-badge {
-  font-size: 10px;
-  color: var(--text-faint);
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-}
-
-.minimal-auth-title {
-  margin: 0 0 4px;
-  font-family: var(--font-display);
-  font-size: 14.5px;
-  font-weight: 700;
-  color: var(--text);
-  letter-spacing: 0.01em;
-}
-
-.minimal-auth-sub {
-  margin: 0 0 14px;
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.45;
-}
-
-.minimal-auth-btn-wrap {
-  display: flex;
-  justify-content: flex-start;
-  align-items: center;
-  min-height: 42px;
 }
 
 /* ---------- modal dialog ---------- */
@@ -729,13 +571,6 @@ body {
   color: var(--text-muted);
   line-height: 1.5;
   margin: 0 0 20px;
-}
-
-.google-btn-container {
-  display: flex;
-  justify-content: center;
-  margin: 24px 0 16px;
-  min-height: 44px;
 }
 
 .modal-notice {
