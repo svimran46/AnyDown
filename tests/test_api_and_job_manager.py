@@ -162,8 +162,36 @@ class SSRFAndFileGuardTests(unittest.TestCase):
     def test_is_exempt_target_denies_all_when_unconfigured(self):
         downloader.YTDLP_POT_PROVIDER_URL = ""
         downloader.FACEBOOK_PROXY_URL = ""
-        self.assertFalse(downloader._is_exempt_target("127.0.0.1", 4416))
+        # 127.0.0.1:4416 stays exempt: yt-dlp's bgutil plugin targets it even
+        # when unconfigured, and blocking it silently disabled the PO-token
+        # provider (see test_pot_provider_default_endpoint_is_exempt).
         self.assertFalse(downloader._is_exempt_target("localhost", 80))
+        self.assertFalse(downloader._is_exempt_target("127.0.0.1", 8000))
+        self.assertFalse(downloader._is_exempt_target("127.0.0.1", None))
+
+    def test_pot_provider_default_endpoint_is_exempt(self):
+        """Regression: the guard blocked yt-dlp's default PO-token endpoint.
+
+        The bgutil plugin targets http://127.0.0.1:4416 regardless of
+        YTDLP_POT_PROVIDER_URL. With the variable unset the guard rejected it
+        as loopback, so the provider was unreachable, mweb had no GVS token,
+        and downloads degraded to a single 360p format.
+        """
+        saved_pot = downloader.YTDLP_POT_PROVIDER_URL
+        try:
+            downloader.YTDLP_POT_PROVIDER_URL = ""
+            for host in ("127.0.0.1", "localhost", "::1", "localhost.localdomain"):
+                self.assertTrue(
+                    downloader._is_exempt_target(host, 4416),
+                    f"{host}:4416 must reach the PO-token provider",
+                )
+            # No other loopback port is opened by this exemption.
+            for port in (8000, 22, 6379, 5432, 9999):
+                self.assertFalse(downloader._is_exempt_target("127.0.0.1", port))
+            # A non-loopback host on the same port is unaffected.
+            self.assertFalse(downloader._is_exempt_target("10.0.0.5", 4416))
+        finally:
+            downloader.YTDLP_POT_PROVIDER_URL = saved_pot
 
     def test_youtube_proxy_is_actually_applied(self):
         """Regression: YOUTUBE_PROXY_URL was set only in _apply_platform_options,

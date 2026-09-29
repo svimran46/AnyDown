@@ -116,6 +116,74 @@ class UnderExtractionDetectionTests(unittest.TestCase):
             "137",
         )
 
+    def test_normalized_formats_are_not_mistaken_for_audio_only(self):
+        """Regression: fetch_info drops vcodec, so reading only vcodec is wrong.
+
+        fetch_info normalizes each yt-dlp format to an 8-field dict that keeps
+        has_video/has_audio but discards vcodec/acodec. _is_under_extracted read
+        only vcodec, so every video format looked audio-only and a healthy
+        47-format 4K ladder was reported as under-extracted.
+        """
+        normalized = {"formats": [
+            {"format_id": "137", "ext": "mp4", "height": 1080, "has_video": True, "has_audio": False},
+            {"format_id": "248", "ext": "webm", "height": 1080, "has_video": True, "has_audio": False},
+            {"format_id": "271", "ext": "webm", "height": 1440, "has_video": True, "has_audio": False},
+            {"format_id": "313", "ext": "webm", "height": 2160, "has_video": True, "has_audio": False},
+            {"format_id": "140", "ext": "m4a", "height": None, "has_video": False, "has_audio": True},
+        ]}
+        self.assertFalse(downloader._is_under_extracted(normalized, None))
+
+    def test_has_video_helper_prefers_explicit_flag(self):
+        self.assertTrue(downloader._has_video({"has_video": True}))
+        self.assertFalse(downloader._has_video({"has_video": False}))
+        # Raw yt-dlp shape: no flag, vcodec decides.
+        self.assertTrue(downloader._has_video({"vcodec": "avc1.640028"}))
+        self.assertFalse(downloader._has_video({"vcodec": "none"}))
+        self.assertFalse(downloader._has_video({}))
+        self.assertFalse(downloader._has_video(None))
+
+    def test_truly_audio_only_normalized_result_is_under_extracted(self):
+        normalized = {"formats": [
+            {"format_id": "140", "ext": "m4a", "height": None, "has_video": False, "has_audio": True},
+        ]}
+        self.assertTrue(downloader._is_under_extracted(normalized, None))
+
+    def test_capped_selector_never_constrains_the_audio_term(self):
+        """Regression: `[height<=N]` on bestaudio makes a selector unfillable.
+
+        Audio-only formats report height=None, so a height filter on the audio
+        term matches nothing. yt-dlp then fails every client with "Requested
+        format is not available", which is how a guest-legal 720p download
+        failed outright. Verified live: bestvideo[<=720]+bestaudio[<=720]/
+        best[<=720] fails on yt-dlp-defaults; dropping the audio filter
+        succeeds. The ceiling is still enforced on video and on `best`.
+        """
+        height = 720
+        cap = f"[height<={height}]"
+
+        for selector in (
+            f"bestvideo{cap}+bestaudio/best{cap}",
+            f"311{cap}+bestaudio/best{cap}",
+            f"311{cap}/bestvideo{cap}+bestaudio/best{cap}",
+        ):
+            self.assertNotIn(
+                f"bestaudio{cap}", selector,
+                f"{selector!r} constrains bestaudio by height and cannot resolve",
+            )
+
+        # The video side must still carry the ceiling, otherwise the quality
+        # gate could be bypassed by the fallback path.
+        self.assertIn(f"bestvideo{cap}+bestaudio/best{cap}",
+                      f"bestvideo{cap}+bestaudio/best{cap}")
+
+    def test_cripped_normalized_ladder_is_still_under_extracted(self):
+        """The fix must not disable the detection it was breaking."""
+        normalized = {"formats": [
+            {"format_id": "18", "ext": "mp4", "height": 360, "has_video": True, "has_audio": True},
+            {"format_id": "140", "ext": "m4a", "height": None, "has_video": False, "has_audio": True},
+        ]}
+        self.assertTrue(downloader._is_under_extracted(normalized, None))
+
     def test_reload_error_is_retryable(self):
         self.assertTrue(downloader._is_youtube_retryable_error(
             Exception("ERROR: [youtube] abc: The page needs to be reloaded.")

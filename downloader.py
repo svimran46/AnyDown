@@ -240,6 +240,9 @@ APP_VERSION = "2.2.0"
 # these, so they are treated as the same host (still gated on the exact port).
 _LOOPBACK_ALIASES = frozenset({"127.0.0.1", "localhost", "::1", "localhost.localdomain"})
 
+# Port yt-dlp's bgutil PO-token plugin uses when YTDLP_POT_PROVIDER_URL is unset.
+_POT_DEFAULT_PORT = 4416
+
 
 def _is_exempt_target(host: str, port: int | None) -> bool:
     """True if (host, port) matches a server-configured peer (e.g. POT provider, proxy).
@@ -249,6 +252,15 @@ def _is_exempt_target(host: str, port: int | None) -> bool:
     loopback peer on 4416 does not open loopback:8000 to SSRF.
     """
     host_clean = host.lower().rstrip(".")
+
+    # yt-dlp's bgutil PO-token plugin targets 127.0.0.1:4416 whether or not
+    # YTDLP_POT_PROVIDER_URL is set. With the variable unset the guard rejected
+    # that endpoint as loopback, which silently disabled the provider and left
+    # the mweb client without a GVS token -- the crippled-360p-ladder failure.
+    # Exempt that exact host:port; no other loopback port is opened.
+    if host_clean in _LOOPBACK_ALIASES and port == _POT_DEFAULT_PORT:
+        return True
+
     for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL, YOUTUBE_PROXY_URL):
         if not url:
             continue
@@ -580,6 +592,21 @@ _UNDER_EXTRACTED_MAX_FORMATS = 8
 _UNDER_EXTRACTED_MAX_HEIGHT = 480
 
 
+def _has_video(fmt: dict) -> bool:
+    """True when a format carries a video track.
+
+    Normalized formats emitted by fetch_info expose an explicit ``has_video``
+    flag and drop ``vcodec``; raw yt-dlp formats carry ``vcodec`` instead.
+    Reading only ``vcodec`` made every normalized format look audio-only, so a
+    healthy 47-format 4K ladder was judged under-extracted.
+    """
+    if not isinstance(fmt, dict):
+        return False
+    if "has_video" in fmt:
+        return bool(fmt.get("has_video"))
+    return fmt.get("vcodec") not in (None, "none")
+
+
 def _is_under_extracted(info: dict | None, attempted_format_id: str | None) -> bool:
     """True when an extraction "succeeded" but returned an unusable format list.
 
@@ -605,7 +632,7 @@ def _is_under_extracted(info: dict | None, attempted_format_id: str | None) -> b
             str(f.get("format_id")) == str(attempted_format_id) for f in formats
         )
 
-    video = [f for f in formats if f.get("vcodec") not in (None, "none")]
+    video = [f for f in formats if _has_video(f)]
     if not video:
         return True
     if len(formats) <= _UNDER_EXTRACTED_MAX_FORMATS:
@@ -690,11 +717,15 @@ def _extract_info_with_youtube_fallback(url: str, base_opts: dict, download: boo
                 for pp in opts.get("postprocessors", [])
                 if isinstance(pp, dict)
             )
+            # As in download_media: never constrain bestaudio by height.
+            # Audio-only formats have height=None, so a `[height<=N]` filter on
+            # the audio term matches nothing and makes the selector fail with
+            # "Requested format is not available" on every client.
             cap = f"[height<={opts['_max_height']}]" if opts.get("_max_height") else ""
             if has_audio_pp:
                 opts["format"] = "bestaudio/best"
             elif cap:
-                opts["format"] = f"bestvideo{cap}+bestaudio{cap}/best{cap}"
+                opts["format"] = f"bestvideo{cap}+bestaudio/best{cap}"
             else:
                 opts["format"] = "bestvideo+bestaudio/best"
             diagnostic_logger.info(
@@ -1003,18 +1034,26 @@ def download_media(
             # in the fallback arm silently hands a guest the 4K rendition of a
             # "720p" request, which is the same gate bypass as omitting the
             # format entirely.
+            # Only the VIDEO side carries a height. Audio-only formats report
+            # height=None, so `[height<=N]` on bestaudio matches nothing and
+            # makes the whole selector unsatisfiable -- yt-dlp then fails with
+            # "Requested format is not available". Verified against live
+            # clients: bestvideo[<=720]+bestaudio[<=720]/best[<=720] fails on
+            # yt-dlp-defaults, while bestvideo[<=720]+bestaudio/best[<=720]
+            # succeeds. The ceiling is enforced on video and on the combined
+            # fallback, which is what actually bounds the delivered quality.
             cap = f"[height<={max_height}]" if max_height else ""
             if format_has_audio:
-                ydl_opts["format"] = f"{format_id}{cap}/bestvideo{cap}+bestaudio{cap}/best{cap}"
+                ydl_opts["format"] = f"{format_id}{cap}/bestvideo{cap}+bestaudio/best{cap}"
             else:
                 ydl_opts["format"] = (
-                    f"{format_id}{cap}+bestaudio{cap}/{format_id}{cap}"
-                    f"/bestvideo{cap}+bestaudio{cap}/best{cap}"
+                    f"{format_id}{cap}+bestaudio/{format_id}{cap}"
+                    f"/bestvideo{cap}+bestaudio/best{cap}"
                 )
         elif max_height:
             # No explicit format but a verified ceiling: honour the ceiling.
             cap = f"[height<={max_height}]"
-            ydl_opts["format"] = f"bestvideo{cap}+bestaudio{cap}/best{cap}"
+            ydl_opts["format"] = f"bestvideo{cap}+bestaudio/best{cap}"
         else:
             ydl_opts["format"] = "bestvideo+bestaudio/best"
 
