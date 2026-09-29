@@ -1,20 +1,73 @@
 // ==UserScript==
-// @name         AnyDown Assistant — Fast Video Downloader
+// @name         AnyDown Assistant — Video Downloader
 // @namespace    https://anydown-com.onrender.com/
-// @version      1.2.0
-// @description  Adds a 1-click Download button directly below YouTube videos for instant MP4 and MP3 downloads.
+// @version      2.0.0
+// @description  Fetches real format data from your own AnyDown server and downloads MP4/MP3 straight to your device. No YouTube page scraping.
 // @author       AnyDown
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
-// @grant        none
-// @run-at       document-end
+// @grant        GM_xmlhttpRequest
+// @grant        GM_download
+// @grant        GM_addStyle
+// @connect      anydown-com.onrender.com
+// @connect      localhost
+// @connect      127.0.0.1
+// @run-at       document-idle
 // ==/UserScript==
+
+// All media data comes from the AnyDown API, not from the YouTube page. That
+// means it works for every format the server can actually serve (including
+// 1080p/1440p/4K that the page hides) and stays correct when YouTube changes
+// its player internals.
+//
+// Requests use GM_xmlhttpRequest rather than fetch(): a userscript running on
+// youtube.com calling a different origin would be blocked by CORS, and
+// GM_xmlhttpRequest is exempt. Downloads use GM_download so the browser saves
+// the file with the server's filename instead of navigating to it.
 
 (() => {
   "use strict";
 
   const ANYDOWN_HOST = "https://anydown-com.onrender.com";
-  let activeMenu = null;
+  const API = `${ANYDOWN_HOST}/api`;
+  const POLL_MS = 1000;
+  const MAX_POLLS = 1800;
+
+  let overlay = null;
+  let busy = false;
+
+  // ---------- helpers ----------
+
+  function api(method, path, body) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method,
+        url: API + path,
+        headers: body ? { "Content-Type": "application/json" } : {},
+        data: body ? JSON.stringify(body) : undefined,
+        timeout: 600000,
+        onload: (res) => {
+          let parsed = null;
+          try {
+            parsed = JSON.parse(res.responseText);
+          } catch (e) {
+            /* non-JSON body */
+          }
+          if (res.status >= 200 && res.status < 300) {
+            resolve(parsed);
+            return;
+          }
+          const detail =
+            (parsed && (parsed.message || parsed.detail)) ||
+            `Server returned ${res.status}.`;
+          reject(new Error(String(detail)));
+        },
+        onerror: () =>
+          reject(new Error(`Could not reach ${ANYDOWN_HOST}. Is the server up?`)),
+        ontimeout: () => reject(new Error("Request timed out.")),
+      });
+    });
+  }
 
   function formatBytes(bytes) {
     if (!bytes || bytes <= 0) return "";
@@ -28,327 +81,403 @@
     return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
   }
 
-  function getPlayerData() {
-    try {
-      // 1. Check window.ytInitialPlayerResponse
-      if (window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.streamingData) {
-        return window.ytInitialPlayerResponse;
-      }
-      // 2. Check movie_player element
-      const player = document.getElementById("movie_player");
-      if (player && typeof player.getPlayerResponse === "function") {
-        const resp = player.getPlayerResponse();
-        if (resp && resp.streamingData) return resp;
-      }
-      // 3. Check ytplayer config args
-      if (window.ytplayer && window.ytplayer.config && window.ytplayer.config.args) {
-        const raw = window.ytplayer.config.args.player_response;
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (parsed && parsed.streamingData) return parsed;
-        }
-      }
-    } catch (e) {
-      console.warn("[AnyDown] Could not read player data:", e);
-    }
-    return null;
+  function formatEta(seconds) {
+    if (!seconds || seconds <= 0) return "";
+    if (seconds < 60) return `${Math.ceil(seconds)}s left`;
+    const m = Math.floor(seconds / 60);
+    return `${m}m left`;
   }
 
-  function extractFormats(playerResponse) {
-    if (!playerResponse || !playerResponse.streamingData) return [];
-    const { formats = [], adaptiveFormats = [] } = playerResponse.streamingData;
-    const title = (playerResponse.videoDetails && playerResponse.videoDetails.title) || document.title.replace(" - YouTube", "").trim() || "video";
-
-    const results = [];
-
-    // 1. Combined Progressive streams (Video + Audio ready to play, usually 720p / 360p)
-    formats.forEach((f) => {
-      if (f.url) {
-        results.push({
-          label: f.qualityLabel || `${f.height}p`,
-          category: "combined",
-          ext: "mp4",
-          note: "Video + Audio (Ready to play)",
-          size: formatBytes(f.contentLength),
-          url: f.url,
-          title: `${title} - ${f.qualityLabel || f.height + "p"}.mp4`,
-        });
-      }
-    });
-
-    // 2. High-res adaptive video streams (1080p, 1440p, 4K)
-    adaptiveFormats.forEach((f) => {
-      const mime = f.mimeType || "";
-      if (mime.startsWith("video/mp4") && f.url) {
-        results.push({
-          label: f.qualityLabel || `${f.height}p`,
-          category: "video_only",
-          ext: "mp4",
-          note: "High-Bitrate Video track",
-          size: formatBytes(f.contentLength),
-          url: f.url,
-          title: `${title} - ${f.qualityLabel || f.height + "p"} (video).mp4`,
-        });
-      }
-    });
-
-    // 3. Audio streams (M4A / WebM)
-    adaptiveFormats.forEach((f) => {
-      const mime = f.mimeType || "";
-      if (mime.startsWith("audio/mp4") && f.url) {
-        const kbps = Math.round((f.bitrate || 128000) / 1000);
-        results.push({
-          label: `Audio M4A (${kbps}k)`,
-          category: "audio",
-          ext: "m4a",
-          note: "High Quality Audio",
-          size: formatBytes(f.contentLength),
-          url: f.url,
-          title: `${title} (audio).m4a`,
-        });
-      }
-    });
-
-    return results;
+  function isAudio(fmt) {
+    return fmt.format_id === "audio-only" || !fmt.has_video;
   }
 
-  function triggerDownload(url, filename) {
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename || "video.mp4";
-    a.target = "_blank";
-    a.rel = "noreferrer noopener";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  function currentVideoUrl() {
+    const url = new URL(window.location.href);
+    if (url.pathname !== "/watch") return null;
+    const v = url.searchParams.get("v");
+    return v ? `https://www.youtube.com/watch?v=${v}` : null;
   }
 
-  function closeMenu() {
-    if (activeMenu) {
-      activeMenu.remove();
-      activeMenu = null;
-    }
+  function el(tag, style, html) {
+    const node = document.createElement(tag);
+    if (style) node.style.cssText = style;
+    if (html !== undefined) node.innerHTML = html;
+    return node;
   }
 
-  function showDownloadMenu(btn) {
-    closeMenu();
+  // ---------- overlay UI ----------
 
-    const data = getPlayerData();
-    if (!data) {
-      alert("AnyDown: Could not detect video streams yet. Please wait a second for the video to load, or play the video and try again.");
-      return;
+  function closeOverlay() {
+    if (overlay) {
+      overlay.remove();
+      overlay = null;
     }
+    document.removeEventListener("keydown", onKeydown);
+  }
 
-    const items = extractFormats(data);
-    if (!items.length) {
-      alert("AnyDown: No direct streams found on this video. It may be DRM protected, age-restricted, or currently loading.");
-      return;
-    }
+  function onKeydown(e) {
+    if (e.key === "Escape") closeOverlay();
+  }
 
-    const currentUrl = window.location.href;
-
-    const menu = document.createElement("div");
-    menu.id = "anydown-dropdown-menu";
-    menu.style.cssText = `
-      position: absolute;
-      z-index: 999999;
-      background: #141716;
-      border: 1px solid #2d3830;
-      border-radius: 8px;
-      padding: 10px;
-      width: 290px;
-      box-shadow: 0 12px 32px rgba(0,0,0,0.8);
+  function openOverlay() {
+    if (overlay) return;
+    overlay = el("div", `
+      position: fixed; inset: 0; z-index: 2147483647;
+      background: rgba(8,10,9,0.86); backdrop-filter: blur(3px);
+      display: flex; align-items: center; justify-content: center;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       color: #e5ede7;
-      animation: anydown-fadein 0.15s ease-out;
+    `);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) closeOverlay();
+    });
+    document.addEventListener("keydown", onKeydown);
+    document.body.appendChild(overlay);
+  }
+
+  function setBody(html) {
+    const box = overlay.querySelector(".anydown-box");
+    if (box) box.innerHTML = html;
+  }
+
+  function renderShell() {
+    openOverlay();
+    overlay.innerHTML = "";
+    const box = el("div", `
+      background: #141716; border: 1px solid #2d3830; border-radius: 12px;
+      width: 560px; max-width: 94vw; max-height: 86vh; overflow-y: auto;
+      padding: 18px 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+      animation: anydown-fadein 0.16s ease-out;
+    `, "");
+    box.className = "anydown-box";
+    box.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;
+                  padding-bottom:10px;border-bottom:1px solid #232d26;margin-bottom:14px;">
+        <span style="font-weight:800;font-size:13px;letter-spacing:0.05em;color:#00dfa2;">
+          ANYDOWN ASSISTANT
+        </span>
+        <button class="anydown-close" style="background:transparent;border:none;color:#7d8c82;
+                font-size:20px;cursor:pointer;line-height:1;padding:0 4px;">&times;</button>
+      </div>
+      <div class="anydown-body" style="font-size:13px;color:#94a399;">Loading&hellip;</div>
     `;
+    box.querySelector(".anydown-close").addEventListener("click", closeOverlay);
+    overlay.appendChild(box);
+  }
+
+  // ---------- render states ----------
+
+  function renderLoading() {
+    setBody(`
+      <div class="anydown-body" style="font-size:13px;color:#94a399;padding:26px 0;text-align:center;">
+        Reading available formats from the AnyDown server&hellip;
+      </div>
+    `);
+  }
+
+  function renderError(message) {
+    setBody(`
+      <div class="anydown-body">
+        <div style="color:#ff7b72;font-size:13px;margin-bottom:12px;">${escapeHtml(message)}</div>
+        <button class="anydown-retry" style="background:#00dfa2;color:#0c0f0d;border:none;
+          border-radius:6px;padding:8px 16px;font-weight:700;cursor:pointer;">Retry</button>
+      </div>
+    `);
+    const retry = overlay.querySelector(".anydown-retry");
+    if (retry) retry.addEventListener("click", () => start(currentVideoUrl()));
+  }
+
+  function escapeHtml(text) {
+    return String(text == null ? "" : text).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+  }
+
+  function renderFormats(info, videoUrl) {
+    const formats = info.formats || [];
+    const audio = [
+      { format_id: "audio-only", has_video: false, note: "Audio only (MP3)", filesize: null },
+      ...formats.filter(isAudio),
+    ];
+    const video = formats.filter((f) => !isAudio(f));
+
+    // De-duplicate by height, best first.
+    const seen = new Set();
+    const videoRows = video
+      .filter((f) => {
+        const key = f.height || f.format_id;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+    const row = (item, label, meta, idx) => `
+      <button class="anydown-fmt" data-idx="${idx}" style="
+        display:flex;align-items:center;justify-content:space-between;width:100%;
+        background:#1b211d;border:1px solid #232d26;border-radius:6px;
+        padding:9px 12px;margin-bottom:6px;color:#e5ede7;font-size:13px;
+        cursor:pointer;text-align:left;transition:all 0.1s ease;">
+        <span style="font-weight:600;">${label}</span>
+        <span style="font-size:11px;color:#7d8c82;font-family:monospace;">${meta}</span>
+      </button>`;
 
     let html = `
-      <div style="display:flex;align-items:center;justify-content:space-between;padding-bottom:8px;border-bottom:1px solid #232d26;margin-bottom:8px;">
-        <span style="font-weight:700;font-size:12px;letter-spacing:0.04em;color:#00dfa2;">ANYDOWN ASSISTANT</span>
-        <span style="font-size:10px;color:#7d8c82;font-family:monospace;">Direct Downloader</span>
-      </div>
-      <div style="font-size:11px;color:#94a399;margin-bottom:6px;font-weight:600;">Combined Formats (Video + Audio):</div>
+      <div class="anydown-body">
+        <div style="margin-bottom:14px;">
+          ${info.thumbnail
+            ? `<img src="${escapeHtml(info.thumbnail)}" alt=""
+                 style="width:100%;max-height:170px;object-fit:contain;border-radius:6px;
+                        background:#0c0f0d;margin-bottom:10px;">`
+            : ""}
+          <div style="font-weight:700;font-size:14px;line-height:1.3;">
+            ${escapeHtml(info.title || "Untitled")}
+          </div>
+          <div style="font-size:11px;color:#7d8c82;margin-top:3px;font-family:monospace;">
+            ${escapeHtml(info.uploader || "")}
+            ${info.duration ? " &middot; " + escapeHtml(fmtDuration(info.duration)) : ""}
+          </div>
+        </div>
     `;
 
-    const combined = items.filter((i) => i.category === "combined");
-    if (combined.length) {
-      combined.forEach((item, idx) => {
-        html += `
-          <button class="anydown-item-btn" data-idx="${idx}" style="
-            display:flex;align-items:center;justify-content:space-between;width:100%;
-            background:#1b211d;border:1px solid #232d26;border-radius:5px;
-            padding:7px 10px;margin-bottom:5px;color:#e5ede7;font-size:12px;
-            cursor:pointer;text-align:left;transition:all 0.1s ease;
-          ">
-            <span style="font-weight:600;color:#00dfa2;">${item.label}</span>
-            <span style="font-size:11px;color:#7d8c82;font-family:monospace;">${item.size || item.ext}</span>
-          </button>
-        `;
+    if (videoRows.length) {
+      html += `<div style="font-size:11px;color:#94a399;margin-bottom:6px;font-weight:700;
+                        text-transform:uppercase;letter-spacing:0.05em;">Video</div>`;
+      const all = [...videoRows, ...audio];
+      videoRows.forEach((f) => {
+        html += row(
+          f,
+          escapeHtml(f.note || `${f.height}p`),
+          `${f.height ? f.height + "p &middot; " : ""}${escapeHtml(formatBytes(f.filesize) || f.ext || "")}`,
+          all.indexOf(f),
+        );
       });
-    } else {
-      html += `<div style="font-size:11px;color:#7d8c82;padding:4px 0;">Only separate high-res streams available below.</div>`;
+      html += `<div style="font-size:11px;color:#94a399;margin:10px 0 6px;font-weight:700;
+                        text-transform:uppercase;letter-spacing:0.05em;">Audio</div>`;
+      audio.forEach((f, i) => {
+        html += row(
+          f,
+          `${isAudio(f) ? "&#9835; " : ""}${escapeHtml(f.note || "Audio (MP3)")}`,
+          escapeHtml(formatBytes(f.filesize) || "mp3"),
+          videoRows.length + i,
+        );
+      });
+      setBody(html.replace(/__ALL__/g, ""));
+      bindRows(all, videoUrl);
+      return;
     }
 
-    const audioItems = items.filter((i) => i.category === "audio");
-    if (audioItems.length) {
-      html += `<div style="font-size:11px;color:#94a399;margin:8px 0 6px;font-weight:600;">Audio Only:</div>`;
-      audioItems.forEach((item, idx) => {
-        const itemIdx = items.indexOf(item);
-        html += `
-          <button class="anydown-item-btn" data-idx="${itemIdx}" style="
-            display:flex;align-items:center;justify-content:space-between;width:100%;
-            background:#1b211d;border:1px solid #232d26;border-radius:5px;
-            padding:6px 10px;margin-bottom:5px;color:#e5ede7;font-size:12px;
-            cursor:pointer;text-align:left;transition:all 0.1s ease;
-          ">
-            <span style="font-weight:500;">🎵 ${item.label}</span>
-            <span style="font-size:11px;color:#7d8c82;font-family:monospace;">${item.size || "m4a"}</span>
-          </button>
-        `;
+    html += `<div style="font-size:12px;color:#7d8c82;">No downloadable formats found.</div>`;
+    setBody(html);
+  }
+
+  function fmtDuration(seconds) {
+    const s = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    return h ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+  }
+
+  function bindRows(all, videoUrl) {
+    overlay.querySelectorAll(".anydown-fmt").forEach((btn) => {
+      btn.addEventListener("mouseenter", () => {
+        btn.style.background = "#232d26";
+        btn.style.borderColor = "#00dfa2";
       });
-    }
-
-    const highRes = items.filter((i) => i.category === "video_only");
-    if (highRes.length) {
-      html += `<div style="font-size:11px;color:#94a399;margin:8px 0 6px;font-weight:600;">High-Res Tracks (1080p+):</div>`;
-      highRes.slice(0, 3).forEach((item) => {
-        const itemIdx = items.indexOf(item);
-        html += `
-          <button class="anydown-item-btn" data-idx="${itemIdx}" style="
-            display:flex;align-items:center;justify-content:space-between;width:100%;
-            background:#1b211d;border:1px solid #232d26;border-radius:5px;
-            padding:6px 10px;margin-bottom:5px;color:#e5ede7;font-size:12px;
-            cursor:pointer;text-align:left;transition:all 0.1s ease;
-          ">
-            <span style="font-weight:500;">🎬 ${item.label} (Video)</span>
-            <span style="font-size:11px;color:#7d8c82;font-family:monospace;">${item.size || ""}</span>
-          </button>
-        `;
+      btn.addEventListener("mouseleave", () => {
+        btn.style.background = "#1b211d";
+        btn.style.borderColor = "#232d26";
       });
-    }
-
-    html += `
-      <div style="margin-top:10px;padding-top:8px;border-top:1px solid #232d26;text-align:center;">
-        <a href="${ANYDOWN_HOST}/?url=${encodeURIComponent(currentUrl)}" target="_blank" style="
-          display:block;font-size:11px;color:#00dfa2;text-decoration:none;font-weight:600;padding:4px 0;
-        ">
-          Open in AnyDown Web Studio &rarr;
-        </a>
-      </div>
-    `;
-
-    menu.innerHTML = html;
-
-    // Attach click listeners to format buttons
-    menu.querySelectorAll(".anydown-item-btn").forEach((itemBtn) => {
-      itemBtn.addEventListener("click", (e) => {
+      btn.addEventListener("click", (e) => {
         e.stopPropagation();
-        const idx = Number(itemBtn.dataset.idx);
-        const targetItem = items[idx];
-        if (targetItem && targetItem.url) {
-          triggerDownload(targetItem.url, targetItem.title);
-          closeMenu();
-        }
-      });
-      itemBtn.addEventListener("mouseenter", () => {
-        itemBtn.style.background = "#232d26";
-        itemBtn.style.borderColor = "#00dfa2";
-      });
-      itemBtn.addEventListener("mouseleave", () => {
-        itemBtn.style.background = "#1b211d";
-        itemBtn.style.borderColor = "#232d26";
+        const item = all[Number(btn.dataset.idx)];
+        if (item && !busy) download(item, videoUrl);
       });
     });
+  }
 
-    const rect = btn.getBoundingClientRect();
-    menu.style.top = `${rect.bottom + window.scrollY + 6}px`;
-    menu.style.left = `${Math.max(10, rect.left + window.scrollX - 100)}px`;
+  // ---------- download flow ----------
 
-    document.body.appendChild(menu);
-    activeMenu = menu;
+  function renderProgress(jobId, pct, speed, eta, label) {
+    const pctText = pct == null ? "" : ` ${Math.round(pct)}%`;
+    setBody(`
+      <div class="anydown-body">
+        <div style="font-size:13px;margin-bottom:12px;">${escapeHtml(label)}</div>
+        <div style="height:8px;background:#1b211d;border-radius:4px;overflow:hidden;">
+          <div style="height:100%;width:${pct == null ? 8 : Math.max(2, Math.min(100, pct))}%;
+                      background:#00dfa2;border-radius:4px;transition:width 0.3s ease;"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:8px;
+                    font-size:11px;color:#7d8c82;font-family:monospace;">
+          <span>${speed ? formatBytes(speed) + "/s" : "starting"}${pctText}</span>
+          <span>${escapeHtml(formatEta(eta) || "")}</span>
+        </div>
+        <div style="margin-top:14px;text-align:center;">
+          <button class="anydown-cancel" style="background:transparent;border:1px solid #2d3830;
+            color:#94a399;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:12px;">
+            Close
+          </button>
+        </div>
+      </div>
+    `);
+    const cancel = overlay.querySelector(".anydown-cancel");
+    if (cancel) cancel.addEventListener("click", () => { busy = false; closeOverlay(); });
+  }
+
+  async function download(item, videoUrl) {
+    busy = true;
+    renderProgress(null, null, null, null, "Requesting download from server\u2026");
+
+    let job;
+    try {
+      job = await api("POST", "/download", {
+        url: videoUrl,
+        format_id: item.format_id,
+        audio_only: isAudio(item),
+      });
+    } catch (err) {
+      busy = false;
+      renderError(err.message);
+      return;
+    }
+
+    const jobId = job.job_id;
+    const startedAt = Date.now();
+    let done = false;
+
+    for (let i = 0; i < MAX_POLLS; i += 1) {
+      await new Promise((r) => setTimeout(r, POLL_MS));
+      if (!busy) return;
+
+      let status;
+      try {
+        status = await api("GET", `/status/${jobId}`);
+      } catch (err) {
+        busy = false;
+        renderError(err.message);
+        return;
+      }
+
+      if (status.status === "completed") {
+        done = true;
+        renderProgress(100, null, null, null, "Saved. Check your downloads.");
+        const filename = status.filename || "video";
+        saveFile(jobId, filename);
+        setTimeout(() => { if (busy) { busy = false; closeOverlay(); } }, 2500);
+        return;
+      }
+
+      if (status.status === "failed") {
+        busy = false;
+        renderError(status.error || "The server could not complete this download.");
+        return;
+      }
+
+      if ((Date.now() - startedAt) % 15000 < POLL_MS) {
+        renderProgress(
+          status.progress, status.speed, status.eta,
+          `Downloading ${escapeHtml(item.note || item.format_id)}\u2026`,
+        );
+      }
+    }
+
+    if (!done) {
+      busy = false;
+      renderError("Download timed out before it finished.");
+    }
+  }
+
+  function saveFile(jobId, filename) {
+    const url = `${API}/file/${jobId}`;
+    try {
+      if (typeof GM_download === "function") {
+        GM_download({ url, name: filename, onerror: () => fallbackSave(url) });
+        return;
+      }
+    } catch (e) {
+      /* fall through */
+    }
+    fallbackSave(url);
+  }
+
+  function fallbackSave(url) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "";
+    a.rel = "noreferrer";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  // ---------- entry point ----------
+
+  async function start(videoUrl) {
+    if (busy) return;
+    if (!videoUrl) {
+      renderShell();
+      renderError("This page is not a YouTube watch page.");
+      return;
+    }
+    busy = true;
+    renderShell();
+    renderLoading();
+    try {
+      const info = await api("POST", "/media/inspect", { url: videoUrl });
+      busy = false;
+      renderFormats(info, videoUrl);
+    } catch (err) {
+      busy = false;
+      renderError(err.message);
+    }
   }
 
   function injectButton() {
     if (document.getElementById("anydown-injected-btn")) return;
-
-    // Standard Desktop YouTube action bar
     const actions = document.querySelector(
-      "#top-row.ytd-watch-metadata #actions #top-level-buttons-computed"
+      "#top-row.ytd-watch-metadata #actions #top-level-buttons-computed",
     );
     if (!actions) return;
 
-    const btn = document.createElement("button");
+    const btn = el("button", `
+      display: inline-flex; align-items: center; justify-content: center;
+      height: 36px; padding: 0 16px; border-radius: 18px; background: #00dfa2;
+      color: #0c0f0d; font-weight: 700; font-size: 13px; border: none;
+      cursor: pointer; margin-right: 8px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      box-shadow: 0 2px 8px rgba(0,223,162,0.3);
+    `);
     btn.id = "anydown-injected-btn";
     btn.setAttribute("type", "button");
     btn.innerHTML = `
-      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right:6px;">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+           stroke-width="2.5" style="margin-right:6px;">
         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
         <polyline points="7 10 12 15 17 10"></polyline>
         <line x1="12" y1="15" x2="12" y2="3"></line>
       </svg>
-      <span>Download</span>
-    `;
-
-    btn.style.cssText = `
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      height: 36px;
-      padding: 0 16px;
-      border-radius: 18px;
-      background: #00dfa2;
-      color: #0c0f0d;
-      font-weight: 700;
-      font-size: 13px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      border: none;
-      cursor: pointer;
-      margin-right: 8px;
-      box-shadow: 0 2px 8px rgba(0, 223, 162, 0.3);
-      transition: transform 0.15s ease, background 0.15s ease;
-    `;
-
-    btn.addEventListener("mouseenter", () => {
-      btn.style.background = "#05f5b4";
-      btn.style.transform = "translateY(-1px)";
-    });
-    btn.addEventListener("mouseleave", () => {
-      btn.style.background = "#00dfa2";
-      btn.style.transform = "translateY(0)";
-    });
-
+      <span>Download</span>`;
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
-      showDownloadMenu(btn);
+      start(currentVideoUrl());
     });
-
     actions.prepend(btn);
   }
 
-  // Global close on click outside
-  document.addEventListener("click", (e) => {
-    if (activeMenu && !activeMenu.contains(e.target)) {
-      closeMenu();
-    }
-  });
-
-  // Handle YouTube Single Page App (SPA) navigation
-  window.addEventListener("yt-navigate-finish", () => {
-    closeMenu();
-    setTimeout(injectButton, 500);
-  });
-
-  // Backup interval in case element loads asynchronously
-  setInterval(injectButton, 1200);
-
-  // Inject animation styles
-  const style = document.createElement("style");
-  style.textContent = `
+  GM_addStyle(`
     @keyframes anydown-fadein {
       from { opacity: 0; transform: translateY(-4px); }
       to { opacity: 1; transform: translateY(0); }
     }
-  `;
-  document.head.appendChild(style);
+  `);
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeOverlay();
+  });
+
+  window.addEventListener("yt-navigate-finish", () => setTimeout(injectButton, 500));
+  setInterval(injectButton, 1200);
 })();
