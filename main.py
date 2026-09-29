@@ -85,26 +85,45 @@ async def _get_or_fetch_info(url: str) -> dict:
         # request does not cancel the shared extraction.
         return await asyncio.shield(future)
 
+    info: dict | None = None
+    error: BaseException | None = None
     try:
         info = await asyncio.to_thread(fetch_info, url)
-    except BaseException as exc:
         async with _info_cache_lock:
-            _info_inflight.pop(url, None)
-        if not future.done():
-            future.set_exception(exc)
-        # Ensure the exception is always retrieved, even if nobody awaited it.
-        future.exception()
+            _info_cache[url] = (time.time(), info)
+            if len(_info_cache) > 256:
+                oldest_key = min(_info_cache.keys(), key=lambda k: _info_cache[k][0])
+                _info_cache.pop(oldest_key, None)
+        return info
+    except BaseException as exc:
+        error = exc
         raise
-
-    async with _info_cache_lock:
-        _info_cache[url] = (time.time(), info)
-        if len(_info_cache) > 256:
-            oldest_key = min(_info_cache.keys(), key=lambda k: _info_cache[k][0])
-            _info_cache.pop(oldest_key, None)
+    finally:
+        # Settle the shared future and drop the in-flight entry on EVERY exit
+        # path, including cancellation delivered while waiting for the cache
+        # lock after the fetch returned.
+        #
+        # Settling was previously split across two code paths, so a leader
+        # cancelled in that window left a pending future behind in
+        # _info_inflight. Every later request for the URL then awaited a future
+        # that could never complete and never fetched again -- one cancelled
+        # request permanently wedged that URL for the life of the process.
+        #
+        # Deliberately contains no `await`: under cancellation a further await
+        # here could be interrupted before the cleanup ran, which is exactly the
+        # bug being fixed. dict.pop is atomic, so it needs no lock.
+        if not future.done():
+            if error is not None:
+                if isinstance(error, asyncio.CancelledError):
+                    future.cancel()
+                else:
+                    future.set_exception(error)
+                    # Ensure the exception is always retrieved, even if nobody
+                    # awaited it, so asyncio does not log it as unhandled.
+                    future.exception()
+            elif info is not None:
+                future.set_result(info)
         _info_inflight.pop(url, None)
-    if not future.done():
-        future.set_result(info)
-    return info
 
 
 async def _cleanup_loop():

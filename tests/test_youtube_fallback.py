@@ -61,6 +61,61 @@ class UnderExtractionDetectionTests(unittest.TestCase):
         self.assertTrue(downloader._is_under_extracted(info, "137"))
         self.assertFalse(downloader._is_under_extracted(info, "18"))
 
+    def test_capped_selector_resolves_to_bare_format_id(self):
+        """Regression: a yt-dlp selector is not a format ID.
+
+        download_media builds selectors such as
+        `137[height<=720]+bestaudio[height<=720]/bestvideo[height<=720]+...`.
+        Taking `split("/")[0]` of that yields
+        "137[height<=720]+bestaudio[height<=720]", which equals no `format_id`
+        in any returned ladder. Every capped extraction was therefore reported
+        as under-extracted, so the client chain threw away good results from
+        the preferred clients and always served the last one.
+        """
+        cap = "[height<=720]"
+        selector = (
+            f"137{cap}+bestaudio{cap}/137{cap}"
+            f"/bestvideo{cap}+bestaudio{cap}/best{cap}"
+        )
+        self.assertEqual(
+            downloader._requested_format_id({"format": selector}), "137"
+        )
+
+        # The healthy ladder that contains 137 must NOT be judged under-extracted.
+        healthy = {"formats": [
+            {"format_id": "18", "vcodec": "avc1", "acodec": "mp4a", "height": 360},
+            {"format_id": "137", "vcodec": "avc1", "acodec": "none", "height": 1080},
+            {"format_id": "140", "vcodec": "none", "acodec": "mp4a", "height": None},
+        ]}
+        self.assertFalse(downloader._is_under_extracted(
+            healthy, downloader._requested_format_id({"format": selector})
+        ))
+
+    def test_generic_selectors_name_no_format(self):
+        """`bestvideo+bestaudio` must not be mistaken for a requested ID."""
+        cap = "[height<=720]"
+        for selector in (
+            f"bestvideo{cap}+bestaudio{cap}/best{cap}",
+            "bestvideo+bestaudio/best",
+            "best",
+            "bv+ba",
+            "",
+        ):
+            self.assertIsNone(
+                downloader._requested_format_id({"format": selector}),
+                f"{selector!r} should not resolve to a format ID",
+            )
+
+    def test_uncapped_and_merged_selectors_resolve(self):
+        self.assertEqual(
+            downloader._requested_format_id({"format": "137/bestvideo+bestaudio/best"}),
+            "137",
+        )
+        self.assertEqual(
+            downloader._requested_format_id({"format": "137+bestaudio/137"}),
+            "137",
+        )
+
     def test_reload_error_is_retryable(self):
         self.assertTrue(downloader._is_youtube_retryable_error(
             Exception("ERROR: [youtube] abc: The page needs to be reloaded.")

@@ -535,6 +535,34 @@ def _is_youtube_retryable_error(error: Exception) -> bool:
     return any(marker in text for marker in markers)
 
 
+# yt-dlp selectors that name no concrete format. If one of these were treated
+# as a requested format ID it would never match an entry in the returned
+# ladder, so every extraction would be reported as under-extracted.
+_GENERIC_SELECTORS = frozenset({
+    "best", "worst", "bestvideo", "bestaudio", "bv", "ba",
+    "bestvideo+bestaudio", "bestaudio+bestvideo", "bv+ba", "ba+bv",
+})
+
+
+def _requested_format_id(opts: dict) -> str | None:
+    """The concrete format ID this attempt asked for, or None if it is generic.
+
+    A yt-dlp selector is not a format ID. download_media builds selectors like
+    `137[height<=720]+bestaudio[height<=720]/bestvideo[height<=720]+...`, so a
+    naive `split("/")[0]` yields "137[height<=720]+bestaudio[height<=720]".
+    That string equals no `format_id` in any returned ladder, which made every
+    capped extraction look under-extracted and forced the client chain to
+    discard good results and fall through to the last client.
+    """
+    selector = (opts.get("format") or "").split("/")[0].strip()
+    if not selector:
+        return None
+    head = selector.split("[", 1)[0].split("+", 1)[0].strip()
+    if not head or head.lower() in _GENERIC_SELECTORS:
+        return None
+    return head
+
+
 def _format_count(info: dict | None) -> int:
     """Number of playable formats an extraction actually produced."""
     if not isinstance(info, dict):
@@ -684,7 +712,7 @@ def _extract_info_with_youtube_fallback(url: str, base_opts: dict, download: boo
             len(clients),
             _client_label(client),
         )
-        requested_format = (opts.get("format") or "").split("/")[0] or None
+        requested_format = _requested_format_id(opts)
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:

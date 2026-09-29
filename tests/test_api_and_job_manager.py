@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import downloader
+from downloader import UnsupportedURLError
 from job_manager import JobManager, JobStatus
 import main
 
@@ -329,6 +330,100 @@ class APITests(unittest.TestCase):
         self.assertEqual(response.media_type, "application/javascript")
         self.assertEqual(response.headers.get("content-disposition"), 'inline; filename="anydown.user.js"')
         self.assertTrue(os.path.exists(response.path))
+
+
+class InfoCoalescingTests(unittest.TestCase):
+    """Regression: a cancelled leader must not poison its URL forever.
+
+    _get_or_fetch_info settles the shared future and removes the _info_inflight
+    entry. When that cleanup ran on two separate code paths, a leader cancelled
+    between the fetch returning and the cache write left a pending future in
+    _info_inflight. Every later request for that URL awaited a future that
+    could never complete and never attempted a fetch again, wedging the URL for
+    the lifetime of the process.
+    """
+
+    URL = "https://example.invalid/video"
+
+    def setUp(self):
+        self._orig_fetch = main.fetch_info
+        self._orig_cache = dict(main._info_cache)
+        main._info_cache.clear()
+        main._info_inflight.clear()
+
+    def tearDown(self):
+        main.fetch_info = self._orig_fetch
+        main._info_cache.clear()
+        main._info_cache.update(self._orig_cache)
+        main._info_inflight.clear()
+
+    def test_cancelled_leader_does_not_wedge_the_url(self):
+        async def scenario():
+            calls = []
+
+            def slow_fetch(url):
+                calls.append(url)
+                time.sleep(0.5)
+                return {"formats": []}
+
+            main.fetch_info = slow_fetch
+
+            leader = asyncio.create_task(main._get_or_fetch_info(self.URL))
+            await asyncio.sleep(0.1)  # leader has registered its future
+            self.assertIn(self.URL, main._info_inflight)
+
+            # Cancel while the leader is between the fetch and the cache write.
+            await main._info_cache_lock.acquire()
+            await asyncio.sleep(0.6)
+            leader.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await leader
+            main._info_cache_lock.release()
+
+            # The in-flight entry must be gone, or the URL stays poisoned.
+            self.assertNotIn(self.URL, main._info_inflight)
+
+            # A fresh request must still be able to fetch.
+            main.fetch_info = lambda url: (calls.append(url), {"formats": []})[1]
+            info = await asyncio.wait_for(main._get_or_fetch_info(self.URL), timeout=3.0)
+            self.assertEqual(info, {"formats": []})
+            self.assertEqual(len(calls), 2)
+
+        asyncio.run(scenario())
+
+    def test_failed_leader_propagates_to_waiters(self):
+        async def scenario():
+            def boom(url):
+                raise UnsupportedURLError("nope")
+
+            main.fetch_info = boom
+            with self.assertRaises(UnsupportedURLError):
+                await main._get_or_fetch_info(self.URL)
+            self.assertNotIn(self.URL, main._info_inflight)
+
+            # A later request must retry rather than reuse the dead future.
+            main.fetch_info = lambda url: {"formats": [{"format_id": "18"}]}
+            info = await asyncio.wait_for(main._get_or_fetch_info(self.URL), timeout=3.0)
+            self.assertEqual(info["formats"][0]["format_id"], "18")
+
+        asyncio.run(scenario())
+
+    def test_successful_fetch_populates_cache_and_clears_inflight(self):
+        async def scenario():
+            main.fetch_info = lambda url: {"formats": [{"format_id": "137"}]}
+            info = await main._get_or_fetch_info(self.URL)
+            self.assertEqual(info["formats"][0]["format_id"], "137")
+            self.assertIn(self.URL, main._info_cache)
+            self.assertNotIn(self.URL, main._info_inflight)
+
+            # Second call is served from cache without re-fetching.
+            calls = []
+            main.fetch_info = lambda url: calls.append(url)
+            again = await main._get_or_fetch_info(self.URL)
+            self.assertEqual(again["formats"][0]["format_id"], "137")
+            self.assertEqual(calls, [])
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":
