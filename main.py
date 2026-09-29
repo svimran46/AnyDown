@@ -269,26 +269,59 @@ async def _validate_public_url(url: str) -> None:
 TRUSTED_PROXY_HOPS = int(os.getenv("TRUSTED_PROXY_HOPS", "0"))
 
 
+def _is_internal_addr(host: str) -> bool:
+    """True when the address belongs to a proxy/LAN rather than a real client."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # A hostname (e.g. "testclient") is not an internal address.
+        return False
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_unspecified
+    )
+
+
 def _get_client_ip(request: Request) -> str:
     """Best-effort client IP for throttling and audit records.
 
-    X-Forwarded-For is client-controlled unless a trusted proxy overwrites it.
-    The deployment default (uvicorn --proxy-headers) already resolves
-    request.client.host from the connecting peer, so this app must NOT trust
-    XFF itself: doing so lets any caller mint unlimited throttle buckets by
-    rotating the header, defeating every rate limiter here.
+    The connecting peer is only useful when the app is reached directly. Behind
+    a reverse proxy (Render, nginx, a tunnel) every request arrives from the
+    same private peer address, so keying throttling on it gives every visitor
+    one shared bucket and the site behaves as though it were single-IP.
 
-    Set TRUSTED_PROXY_HOPS to the number of proxies in front of the app only if
-    those proxies overwrite (not append to) the header.
+    uvicorn's --proxy-headers rewrites scope["client"] from X-Forwarded-For,
+    which makes the peer authoritative -- but only when that flag is actually
+    passed. Under Render's native Python runtime start.sh never runs, the flag
+    is absent, and the peer is the router's address. So: when the peer is a
+    private address, fall back to the header.
+
+    The RIGHTMOST public hop is used, not the leftmost. Proxies append the
+    address they actually saw, so the last public entry is the one the edge
+    observed, while anything a caller prepends is discarded -- otherwise any
+    client could spoof X-Forwarded-For and mint unlimited throttle buckets.
     """
-    if TRUSTED_PROXY_HOPS > 0:
-        xfwd = request.headers.get("x-forwarded-for")
-        if xfwd:
-            hops = [h.strip() for h in xfwd.split(",") if h.strip()]
-            if hops:
-                index = max(0, len(hops) - TRUSTED_PROXY_HOPS)
-                return hops[index]
-    return request.client.host if request.client else "unknown"
+    peer = request.client.host if request.client else None
+    xff = request.headers.get("x-forwarded-for")
+
+    if TRUSTED_PROXY_HOPS > 0 and xff:
+        hops = [h.strip() for h in xff.split(",") if h.strip()]
+        if hops:
+            index = max(0, len(hops) - TRUSTED_PROXY_HOPS)
+            return hops[index]
+
+    if peer and not _is_internal_addr(peer):
+        return peer
+
+    if xff:
+        hops = [h.strip() for h in xff.split(",") if h.strip()]
+        public = [h for h in hops if not _is_internal_addr(h)]
+        if public:
+            return public[-1]
+
+    return peer or "unknown"
 
 
 def _throttle(client_ip: str, table: dict[str, float], delay_seconds: float) -> None:
@@ -590,10 +623,16 @@ def get_userscript():
     """Serves the AnyDown Tampermonkey/Violentmonkey companion userscript."""
     path = os.path.join(FRONTEND_DIR, "anydown.user.js")
     if os.path.exists(path):
+        # attachment, not inline: opening the link should save the script to
+        # the user's device rather than render the JavaScript source in the
+        # browser as a readable page.
         return FileResponse(
             path,
             media_type="application/javascript",
-            headers={"Content-Disposition": "inline; filename=\"anydown.user.js\""},
+            headers={
+                "Content-Disposition":
+                    'attachment; filename="anydown-assistant.user.js"'
+            },
         )
     raise HTTPException(status_code=404, detail="Userscript not found.")
 

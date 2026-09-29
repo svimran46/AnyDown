@@ -356,7 +356,12 @@ class APITests(unittest.TestCase):
         # Verify /anydown.user.js returns the userscript file with application/javascript
         response = main.get_userscript()
         self.assertEqual(response.media_type, "application/javascript")
-        self.assertEqual(response.headers.get("content-disposition"), 'inline; filename="anydown.user.js"')
+        # attachment (not inline) so the link saves the script to disk instead
+        # of rendering the JavaScript source as a readable page.
+        self.assertEqual(
+            response.headers.get("content-disposition"),
+            'attachment; filename="anydown-assistant.user.js"',
+        )
         self.assertTrue(os.path.exists(response.path))
 
 
