@@ -86,18 +86,27 @@ class JobManager:
             job.updated_at = time.time()
 
     def cleanup_expired(self, output_dir: str | None = None) -> None:
-        """Drop expired jobs (completed, failed, or stuck) and delete their files."""
+        """Drop expired terminal jobs and delete their files.
+
+        A job that is still QUEUED or DOWNLOADING is never expired here, no
+        matter how long it has been running. Evicting an active job deletes the
+        file out from under the download, and Job.update() then silently no-ops
+        on the missing job, so the download is never marked COMPLETED, its file
+        is never registered for deletion, and /api/status starts returning 404
+        for a download that is still running (a permanent disk leak).
+        """
         now = time.time()
         with self._lock:
             expired_ids = []
             for jid, job in self._jobs.items():
-                if job.finished_at is not None:
-                    if now - job.finished_at > self.file_ttl_seconds:
-                        expired_ids.append(jid)
-                else:
-                    # Stuck in QUEUED or DOWNLOADING longer than file_ttl_seconds
-                    if now - job.updated_at > self.file_ttl_seconds:
-                        expired_ids.append(jid)
+                if job.status not in (JobStatus.COMPLETED, JobStatus.FAILED):
+                    # Still in flight: keep it, but refresh updated_at so the
+                    # job stays visible to the caller.
+                    job.updated_at = now
+                    continue
+                stamp = job.finished_at if job.finished_at is not None else job.updated_at
+                if now - stamp > self.file_ttl_seconds:
+                    expired_ids.append(jid)
             expired_jobs = [self._jobs.pop(jid) for jid in expired_ids]
 
         for job in expired_jobs:
@@ -111,27 +120,31 @@ class JobManager:
         # Sweep all residual files from expired jobs as well as orphaned temp files
         if output_dir and os.path.isdir(output_dir):
             cutoff = now - self.file_ttl_seconds
+            try:
+                listings = os.listdir(output_dir)
+            except OSError:
+                return
+
+            # One listdir for all expired jobs, not one per job (was O(n^2)).
             for job in expired_jobs:
                 prefix = job.id + "."
-                try:
-                    for fname in os.listdir(output_dir):
-                        if fname.startswith(prefix):
+                for fname in listings:
+                    if fname.startswith(prefix):
+                        try:
                             os.remove(os.path.join(output_dir, fname))
-                except OSError:
-                    pass
+                        except OSError:
+                            # Per-file guard: one failure must not skip the rest.
+                            continue
 
-            try:
-                for fname in os.listdir(output_dir):
-                    if not (fname.endswith(".part") or fname.endswith(".ytdl") or fname.endswith(".temp") or fname.endswith(".tmp") or fname.endswith(".aria2")):
-                        continue
-                    path = os.path.join(output_dir, fname)
-                    try:
-                        if os.path.getmtime(path) < cutoff:
-                            os.remove(path)
-                    except OSError:
-                        continue
-            except OSError:
-                pass
+            for fname in listings:
+                if not fname.endswith((".part", ".ytdl", ".temp", ".tmp", ".aria2")):
+                    continue
+                path = os.path.join(output_dir, fname)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                except OSError:
+                    continue
 
 
 job_manager = JobManager()

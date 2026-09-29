@@ -11,6 +11,107 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import downloader  # noqa: E402
+import yt_dlp  # noqa: E402
+
+
+class UnderExtractionDetectionTests(unittest.TestCase):
+    """Regression tests for the "asks for cookies" failure mode.
+
+    A pinned YouTube client (notably `mweb` without a GVS PO token) does not
+    raise: it returns HTTP 200 with a single 360p progressive format. A
+    success-based fallback chain accepted that, never tried the remaining
+    clients, and served a one-rung quality ladder. Users read that as a missing
+    cookies problem.
+    """
+
+    def test_empty_format_list_is_under_extracted(self):
+        self.assertTrue(downloader._is_under_extracted({"formats": []}, None))
+        self.assertTrue(downloader._is_under_extracted({}, None))
+        self.assertTrue(downloader._is_under_extracted(None, None))
+
+    def test_audio_only_result_is_under_extracted(self):
+        info = {"formats": [
+            {"format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2", "height": None},
+        ]}
+        self.assertTrue(downloader._is_under_extracted(info, None))
+
+    def test_mweb_single_360p_result_is_under_extracted(self):
+        # Exactly what mweb returns without a GVS PO token.
+        info = {"formats": [
+            {"format_id": "18", "vcodec": "avc1.42001E", "acodec": "mp4a.40.2", "height": 360},
+            {"format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2", "height": None},
+        ]}
+        self.assertTrue(downloader._is_under_extracted(info, None))
+
+    def test_healthy_ladder_is_not_under_extracted(self):
+        info = {"formats": [
+            {"format_id": "18", "vcodec": "avc1", "acodec": "mp4a", "height": 360},
+            {"format_id": "22", "vcodec": "avc1", "acodec": "mp4a", "height": 720},
+            {"format_id": "137", "vcodec": "avc1", "acodec": "none", "height": 1080},
+            {"format_id": "248", "vcodec": "vp9", "acodec": "none", "height": 1080},
+            {"format_id": "313", "vcodec": "vp9", "acodec": "none", "height": 2160},
+            {"format_id": "271", "vcodec": "vp9", "acodec": "none", "height": 1440},
+        ]}
+        self.assertFalse(downloader._is_under_extracted(info, None))
+
+    def test_missing_requested_format_is_under_extracted(self):
+        info = {"formats": [
+            {"format_id": "18", "vcodec": "avc1", "acodec": "mp4a", "height": 360},
+        ]}
+        self.assertTrue(downloader._is_under_extracted(info, "137"))
+        self.assertFalse(downloader._is_under_extracted(info, "18"))
+
+    def test_reload_error_is_retryable(self):
+        self.assertTrue(downloader._is_youtube_retryable_error(
+            Exception("ERROR: [youtube] abc: The page needs to be reloaded.")
+        ))
+
+    def test_chain_skips_silent_under_extraction(self):
+        """An under-extracted 'success' must not end the chain."""
+        calls = []
+
+        def fake_ydl_factory(opts):
+            calls.append(opts.get("extractor_args", {}).get("youtube"))
+            return FakeYDL(len(calls), opts)
+
+        class FakeYDL:
+            def __init__(self, n, opts):
+                self.n, self.opts = n, opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                if self.n == 1:
+                    # mweb-style silent degradation: no error, one 360p format.
+                    return {"formats": [
+                        {"format_id": "18", "vcodec": "avc1", "acodec": "mp4a", "height": 360},
+                    ]}
+                return {"formats": [
+                    {"format_id": "18", "vcodec": "avc1", "acodec": "mp4a", "height": 360},
+                    {"format_id": "22", "vcodec": "avc1", "acodec": "mp4a", "height": 720},
+                    {"format_id": "137", "vcodec": "avc1", "acodec": "none", "height": 1080},
+                    {"format_id": "248", "vcodec": "vp9", "acodec": "none", "height": 1080},
+                    {"format_id": "313", "vcodec": "vp9", "acodec": "none", "height": 2160},
+                ]}
+
+        saved = yt_dlp.YoutubeDL
+        try:
+            yt_dlp.YoutubeDL = fake_ydl_factory
+            info, client = downloader._extract_info_with_youtube_fallback(
+                "https://www.youtube.com/watch?v=x",
+                {"quiet": True, "extractor_args": {}},
+                download=False,
+            )
+        finally:
+            yt_dlp.YoutubeDL = saved
+
+        self.assertEqual(len(calls), 2, "should have retried past the degraded client")
+        self.assertEqual(client, "tv")
+        self.assertEqual(len(info["formats"]), 5)
 
 
 class ClientChainTests(unittest.TestCase):
@@ -154,6 +255,19 @@ class VersionMarkerTests(unittest.TestCase):
 
     def test_app_version_is_nonempty_semverish(self):
         self.assertRegex(downloader.APP_VERSION, r"^\d+\.\d+\.\d+$")
+
+    def test_version_markers_agree(self):
+        """Regression: downloader.APP_VERSION, the FastAPI version and the docs
+        each carried a different value, defeating the 'is the deploy fresh?'
+        check this project relies on."""
+        import main
+
+        self.assertEqual(main.app.version, downloader.APP_VERSION)
+
+        docs = os.path.join(os.path.dirname(__file__), "..", "RENDER-YOUTUBE.md")
+        with open(docs, "r", encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn(f'"app_version": "{downloader.APP_VERSION}"', body)
 
     def test_bot_check_error_includes_app_version(self):
         msg = downloader._friendly_error(

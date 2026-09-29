@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import auth
 import authorization
 import database
+import downloader
 import main
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -89,7 +90,9 @@ class GoogleTokenVerificationTests(AuthAndGateBaseTestCase):
         with self.assertRaises(HTTPException) as ctx:
             auth.verify_google_credential("expired-credential")
         self.assertEqual(ctx.exception.status_code, 401)
-        self.assertIn("Invalid Google token", ctx.exception.detail)
+        # The library's own message is not echoed back to the client.
+        self.assertIn("Invalid", ctx.exception.detail)
+        self.assertNotIn("Token expired", ctx.exception.detail)
 
     @patch("google.oauth2.id_token.verify_oauth2_token")
     def test_verify_invalid_issuer_raises_401(self, mock_verify):
@@ -248,6 +251,7 @@ class QualityAccessGatePolicyTests(unittest.TestCase):
     def test_can_download_format_guest(self):
         # Audio-only is always allowed
         self.assertTrue(authorization.can_download_format(None, 0, audio_only=True))
+        self.assertTrue(authorization.can_download_format(None, None, audio_only=True))
 
         # Video at or below 720p is allowed
         self.assertTrue(authorization.can_download_format(None, 360, audio_only=False))
@@ -258,6 +262,15 @@ class QualityAccessGatePolicyTests(unittest.TestCase):
         self.assertFalse(authorization.can_download_format(None, 1080, audio_only=False))
         self.assertFalse(authorization.can_download_format(None, 1440, audio_only=False))
         self.assertFalse(authorization.can_download_format(None, 2160, audio_only=False))
+
+    def test_unknown_video_height_is_denied(self):
+        """A video with an unverifiable height must fail closed.
+
+        Regression: the gate used to return True for height=None, which is what
+        made "omit format_id" a complete bypass.
+        """
+        self.assertFalse(authorization.can_download_format(None, None, audio_only=False))
+        self.assertFalse(authorization.can_download_format({"id": "u"}, None, audio_only=False))
 
     def test_can_download_format_authenticated(self):
         mock_user = {"id": "user-uuid-1", "email": "test@example.com"}
@@ -282,6 +295,25 @@ class QualityAccessGatePolicyTests(unittest.TestCase):
         self.assertTrue(annotated[2]["locked"])
         self.assertTrue(annotated[3]["locked"])
 
+    def test_audio_formats_are_not_locked_for_guests(self):
+        """Audio-only formats have no height but must stay unlocked."""
+        ladder = [
+            {"format_id": "140", "height": None, "has_video": False, "has_audio": True},
+            {"format_id": "251", "height": None, "has_video": False, "has_audio": True},
+        ]
+        annotated = authorization.annotate_formats_with_locks(ladder, user=None)
+        self.assertFalse(annotated[0]["locked"])
+        self.assertFalse(annotated[1]["locked"])
+
+    def test_raw_vcodec_formats_are_recognised_as_audio(self):
+        ladder = [
+            {"format_id": "140", "height": None, "vcodec": "none", "acodec": "mp4a.40.5"},
+            {"format_id": "137", "height": 1080, "vcodec": "avc1.640028", "acodec": "none"},
+        ]
+        annotated = authorization.annotate_formats_with_locks(ladder, user=None)
+        self.assertFalse(annotated[0]["locked"])
+        self.assertTrue(annotated[1]["locked"])
+
     def test_format_lock_annotations_for_authenticated(self):
         ladder = [
             {"height": 360, "format_id": "18"},
@@ -300,68 +332,172 @@ class QualityAccessGatePolicyTests(unittest.TestCase):
 class DownloadGateEndpointEnforcementTests(AuthAndGateBaseTestCase):
     """Test start_download enforcement of actual height and bypass rejection."""
 
+    _LADDER = {
+        "formats": [
+            {"format_id": "18", "height": 360, "has_video": True, "has_audio": True},
+            {"format_id": "22", "height": 720, "has_video": True, "has_audio": True},
+            {"format_id": "137", "height": 1080, "has_video": True, "has_audio": False},
+            {"format_id": "313", "height": 2160, "has_video": True, "has_audio": False},
+            {"format_id": "140", "height": None, "has_video": False, "has_audio": True},
+        ]
+    }
+
+    def _run_download(self, payload, info=None, request=None):
+        # `if request is None`, not `request or ...`: MagicMock(spec=Request)
+        # is falsy, so `or` would silently swap an authenticated request for a
+        # fresh guest one.
+        if request is None:
+            request = self._create_mock_request()
+        with patch.object(main, "_throttle", return_value=None), \
+             patch.object(main, "_validate_public_url", return_value=None), \
+             patch.object(
+                 main, "_get_or_fetch_info",
+                 return_value=self._LADDER if info is None else info,
+             ), \
+             patch.object(main, "_execute_download_job") as run:
+            res = asyncio.run(main.start_download(payload, request))
+        return res, run
+
     def test_guest_downloading_720p_allowed(self):
         payload = main.DownloadRequest(
             url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            format_id="22",
             height=720,
             audio_only=False,
         )
-        request = self._create_mock_request()
-
-        with patch.object(main, "_throttle", return_value=None):
-            with patch.object(main, "_validate_public_url", return_value=None):
-                with patch.object(main, "_get_or_fetch_info", return_value={"formats": [{"format_id": "22", "height": 720}]}):
-                    with patch.object(main, "_execute_download_job"):
-                        res = asyncio.run(main.start_download(payload, request))
-                        self.assertIn("job_id", res)
-                        self.assertEqual(res["status"], "queued")
+        res, _ = self._run_download(payload)
+        self.assertIn("job_id", res)
+        self.assertEqual(res["status"], "queued")
 
     def test_guest_downloading_1080p_rejected_with_401_login_required(self):
-        import json
         payload = main.DownloadRequest(
             url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            format_id="137",
             height=1080,
             audio_only=False,
         )
-        request = self._create_mock_request()
-
-        with patch.object(main, "_throttle", return_value=None):
-            with patch.object(main, "_validate_public_url", return_value=None):
-                res = asyncio.run(main.start_download(payload, request))
-                self.assertEqual(res.status_code, 401)
-                detail = json.loads(res.body.decode("utf-8"))
-                self.assertEqual(detail["error"], "LOGIN_REQUIRED")
-                self.assertEqual(detail["requiredHeight"], 1080)
-                self.assertIn("Sign in with Google", detail["message"])
+        res, _ = self._run_download(payload)
+        self.assertEqual(res.status_code, 401)
+        detail = json.loads(res.body.decode("utf-8"))
+        self.assertEqual(detail["error"], "LOGIN_REQUIRED")
+        self.assertEqual(detail["requiredHeight"], 1080)
+        self.assertIn("Sign in with Google", detail["message"])
 
     def test_client_fake_height_bypass_rejected(self):
-        import json
-        # Client maliciously sends height=720 or height=None, but format_id is a 1080p stream
+        # Client maliciously sends height=720, but format_id is a 1080p stream
         payload = main.DownloadRequest(
             url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
             format_id="137",
             height=720,  # Claiming 720p
             audio_only=False,
         )
+        res, _ = self._run_download(payload)
+        self.assertEqual(res.status_code, 401)
+        detail = json.loads(res.body.decode("utf-8"))
+        self.assertEqual(detail["error"], "LOGIN_REQUIRED")
+        self.assertEqual(detail["requiredHeight"], 1080)
+
+    def test_omitting_format_id_is_rejected(self):
+        # Regression: a guest used to be able to POST no format_id at all. That
+        # left actual_height at the client-supplied height (None), and
+        # can_download_format(None, None) returned True -- after which yt-dlp
+        # downloaded `bestvideo+bestaudio/best`, i.e. the highest quality.
+        payload = main.DownloadRequest(
+            url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            format_id=None,
+            height=None,
+            audio_only=False,
+        )
+        res, run = self._run_download(payload)
+        self.assertEqual(res.status_code, 400)
+        detail = json.loads(res.body.decode("utf-8"))
+        self.assertIn("format", detail["message"].lower())
+        run.assert_not_called()
+
+    def test_nonexistent_format_id_is_rejected(self):
+        # Regression: a bogus format_id used to leave actual_height at the
+        # client-supplied value, and yt-dlp's `f"{format_id}+bestaudio/..."`
+        # selector silently fell through to `bestvideo+bestaudio/best`.
+        for claimed_height in (None, 0, 360, 720):
+            with self.subTest(claimed_height=claimed_height):
+                payload = main.DownloadRequest(
+                    url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    format_id="99999",
+                    height=claimed_height,
+                    audio_only=False,
+                )
+                res, run = self._run_download(payload)
+                self.assertEqual(res.status_code, 400)
+                run.assert_not_called()
+
+    def test_guest_cannot_get_4k_by_claiming_low_height(self):
+        payload = main.DownloadRequest(
+            url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            format_id="313",  # 2160p
+            height=144,
+            audio_only=False,
+        )
+        res, _ = self._run_download(payload)
+        self.assertEqual(res.status_code, 401)
+        detail = json.loads(res.body.decode("utf-8"))
+        self.assertEqual(detail["requiredHeight"], 2160)
+
+    def test_verified_height_is_passed_to_downloader_as_ceiling(self):
+        payload = main.DownloadRequest(
+            url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            format_id="22",
+            height=720,
+            audio_only=False,
+        )
+        res, run = self._run_download(payload)
+        self.assertIn("job_id", res)
+        # The job is scheduled with the verified ceiling so the downloader
+        # cannot resolve a higher rendition.
+        self.assertEqual(run.call_args.args[2], 720)
+
+    def test_audio_only_allowed_for_guests(self):
+        payload = main.DownloadRequest(
+            url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            format_id=None,
+            audio_only=True,
+        )
+        res, _ = self._run_download(payload)
+        self.assertIn("job_id", res)
+        self.assertEqual(res["status"], "queued")
+
+    def test_audio_only_format_id_treated_as_audio(self):
+        # Requesting the raw audio format (140) with audio_only=False must not
+        # be treated as a video request with an unknown height.
+        payload = main.DownloadRequest(
+            url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            format_id="140",
+            height=None,
+            audio_only=False,
+        )
+        res, run = self._run_download(payload)
+        self.assertIn("job_id", res)
+        self.assertIsNone(run.call_args.args[2])
+
+    def test_info_fetch_failure_does_not_open_the_gate(self):
+        # Regression: `except Exception: pass` around the format lookup used to
+        # leave the gate trusting the client's height when extraction failed.
+        payload = main.DownloadRequest(
+            url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            format_id="137",
+            height=720,
+            audio_only=False,
+        )
         request = self._create_mock_request()
-
-        # Mock media info where format 137 has height 1080
-        fake_info = {
-            "formats": [
-                {"format_id": "18", "height": 360},
-                {"format_id": "22", "height": 720},
-                {"format_id": "137", "height": 1080},
-            ]
-        }
-
-        with patch.object(main, "_throttle", return_value=None):
-            with patch.object(main, "_validate_public_url", return_value=None):
-                with patch.object(main, "_get_or_fetch_info", return_value=fake_info):
-                    res = asyncio.run(main.start_download(payload, request))
-                    self.assertEqual(res.status_code, 401)
-                    detail = json.loads(res.body.decode("utf-8"))
-                    self.assertEqual(detail["error"], "LOGIN_REQUIRED")
-                    self.assertEqual(detail["requiredHeight"], 1080)
+        with patch.object(main, "_throttle", return_value=None), \
+             patch.object(main, "_validate_public_url", return_value=None), \
+             patch.object(
+                 main, "_get_or_fetch_info",
+                 side_effect=downloader.UnsupportedURLError("extraction failed"),
+             ), \
+             patch.object(main, "_execute_download_job") as run:
+            res = asyncio.run(main.start_download(payload, request))
+        self.assertEqual(res.status_code, 400)
+        run.assert_not_called()
 
     def test_authenticated_user_downloading_1080p_allowed(self):
         # Create an authenticated user and valid session
@@ -379,19 +515,9 @@ class DownloadGateEndpointEnforcementTests(AuthAndGateBaseTestCase):
         )
         request = self._create_mock_request(cookies={auth.COOKIE_NAME_INSECURE: raw_token})
 
-        fake_info = {
-            "formats": [
-                {"format_id": "137", "height": 1080},
-            ]
-        }
-
-        with patch.object(main, "_throttle", return_value=None):
-            with patch.object(main, "_validate_public_url", return_value=None):
-                with patch.object(main, "_get_or_fetch_info", return_value=fake_info):
-                    with patch.object(main, "_execute_download_job"):
-                        res = asyncio.run(main.start_download(payload, request))
-                        self.assertIn("job_id", res)
-                        self.assertEqual(res["status"], "queued")
+        res, _ = self._run_download(payload, request=request)
+        self.assertIn("job_id", res)
+        self.assertEqual(res["status"], "queued")
 
 
 class AuthEndpointsDirectTests(AuthAndGateBaseTestCase):
@@ -467,33 +593,207 @@ class CredentialFileStorageTests(unittest.TestCase):
             user_info,
             client_ip="198.51.100.42",
             user_agent="Mozilla/5.0 TestBrowser",
-            session_id="session-uuid-xyz",
+            user_id="user-uuid-abc",
+            session_id="a" * 64,  # SHA-256 hex of the session token
         )
 
         self.assertTrue(os.path.exists(auth.CREDENTIALS_TXT))
         self.assertTrue(os.path.exists(auth.CREDENTIALS_JSONL))
 
-        # Check TXT
+    def test_record_credential_to_file_contents(self):
+        user_info = {
+            "email": "stored_user@example.com",
+            "name": "Stored User",
+            "sub": "google-sub-9999",
+            "picture": "https://avatar.example.com/p.jpg",
+            "email_verified": True,
+        }
+        auth.record_credential_to_file(
+            user_info,
+            client_ip="198.51.100.42",
+            user_agent="Mozilla/5.0 TestBrowser",
+            user_id="user-uuid-abc",
+            session_id="a" * 64,
+        )
         with open(auth.CREDENTIALS_TXT, "r", encoding="utf-8") as f:
             txt_content = f.read()
-            self.assertIn("Email: stored_user@example.com", txt_content)
-            self.assertIn("Name: Stored User", txt_content)
-            self.assertIn("GoogleID: google-sub-9999", txt_content)
-            self.assertIn("IP: 198.51.100.42", txt_content)
+        self.assertIn("Email: stored_user@example.com", txt_content)
+        self.assertIn("Name: Stored User", txt_content)
+        self.assertIn("GoogleID: google-sub-9999", txt_content)
+        self.assertIn("UserID: user-uuid-abc", txt_content)
+        self.assertIn("IP: 198.51.100.42", txt_content)
+        # The full token hash is not written in the human-readable log.
+        self.assertIn("SessionHash: " + "a" * 12, txt_content)
+        self.assertNotIn("a" * 64, txt_content)
 
-        # Check JSONL
         with open(auth.CREDENTIALS_JSONL, "r", encoding="utf-8") as f:
-            line = f.readline()
-            data = json.loads(line)
-            self.assertEqual(data["email"], "stored_user@example.com")
-            self.assertEqual(data["name"], "Stored User")
-            self.assertEqual(data["google_id"], "google-sub-9999")
-            self.assertEqual(data["client_ip"], "198.51.100.42")
-            self.assertEqual(data["session_id"], "session-uuid-xyz")
+            data = json.loads(f.readline())
+        self.assertEqual(data["email"], "stored_user@example.com")
+        self.assertEqual(data["name"], "Stored User")
+        self.assertEqual(data["google_id"], "google-sub-9999")
+        self.assertEqual(data["client_ip"], "198.51.100.42")
+        self.assertEqual(data["user_id"], "user-uuid-abc")
+        self.assertEqual(data["session_token_hash"], "a" * 64)
 
 
-class ThrottleAndErrorDetailTests(unittest.TestCase):
+class SessionPruningTests(AuthAndGateBaseTestCase):
+    """Regression: every login inserted a session row and nothing ever
+    removed them, so the table grew without bound."""
+
+    def test_repeated_logins_do_not_grow_sessions_unbounded(self):
+        user = database.upsert_user("sub-many", "many@example.com", True, "Many", None)
+        user_id = str(user["id"])
+        for i in range(15):
+            database.create_session(
+                user_id,
+                auth.hash_token(f"tok-{i}"),
+                datetime.now(timezone.utc) + timedelta(days=1),
+            )
+        database.prune_sessions_for_user(user_id, keep=10)
+        conn = database._get_connection()
+        with conn:
+            rows = conn.execute(
+                "SELECT COUNT(*) AS c FROM sessions WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        conn.close()
+        self.assertLessEqual(rows["c"], 10)
+
+    def test_prune_expired_sessions_removes_only_expired(self):
+        user = database.upsert_user("sub-exp2", "exp2@example.com", True, "Exp", None)
+        user_id = str(user["id"])
+        now = datetime.now(timezone.utc)
+        database.create_session(user_id, auth.hash_token("old"), now - timedelta(days=1))
+        database.create_session(user_id, auth.hash_token("new"), now + timedelta(days=1))
+        database.prune_expired_sessions()
+        conn = database._get_connection()
+        with conn:
+            rows = conn.execute(
+                "SELECT token_hash FROM sessions WHERE user_id = ?", (user_id,)
+            ).fetchall()
+        conn.close()
+        hashes = {r["token_hash"] for r in rows}
+        self.assertNotIn(auth.hash_token("old"), hashes)
+        self.assertIn(auth.hash_token("new"), hashes)
+
+    def test_bare_filenames_do_not_lose_records(self):
+        """Regression: makedirs(os.path.dirname("x.txt")) raised FileNotFoundError,
+        which was swallowed, silently discarding every credential record."""
+        orig_txt = auth.CREDENTIALS_TXT
+        orig_jsonl = auth.CREDENTIALS_JSONL
+        cwd = os.getcwd()
+        try:
+            work = tempfile.mkdtemp()
+            os.chdir(work)
+            # Bare filenames, with no directory component at all.
+            auth.CREDENTIALS_TXT = "creds.txt"
+            auth.CREDENTIALS_JSONL = "creds.jsonl"
+            auth.record_credential_to_file(
+                {"email": "bare@example.com", "name": "Bare", "sub": "s1"},
+                client_ip="1.2.3.4",
+            )
+            self.assertTrue(os.path.exists(os.path.join(work, "creds.txt")))
+            self.assertTrue(os.path.exists(os.path.join(work, "creds.jsonl")))
+        finally:
+            os.chdir(cwd)
+            auth.CREDENTIALS_TXT = orig_txt
+            auth.CREDENTIALS_JSONL = orig_jsonl
+            shutil.rmtree(work, ignore_errors=True)
+
+
+class ThrottleAndErrorDetailTests(AuthAndGateBaseTestCase):
     """Test detailed actionable error messages and rate limit feedback."""
+
+    def test_logout_clears_secure_cookie_with_secure_attribute(self):
+        """Regression: a __Host- Set-Cookie without Secure is rejected by the
+        browser, so the deletion was silently ignored on HTTPS."""
+        user = database.upsert_user("sub-c", "c@example.com", True, "C", None)
+        raw = "raw-cookie-token"
+        database.create_session(
+            str(user["id"]),
+            auth.hash_token(raw),
+            datetime.now(timezone.utc) + timedelta(days=1),
+        )
+        request = self._create_mock_request(
+            cookies={auth.COOKIE_NAME_SECURE: raw}, is_https=True
+        )
+        response = Response()
+        auth.logout_user(request, response)
+
+        cookies = [
+            v for k, v in response.raw_headers if k == b"set-cookie"
+        ]
+        secure_deletion = [
+            c.decode("latin-1") for c in cookies
+            if c.decode("latin-1").startswith(auth.COOKIE_NAME_SECURE)
+        ]
+        self.assertEqual(len(secure_deletion), 1)
+        header = secure_deletion[0]
+        self.assertIn("Max-Age=0", header)
+        self.assertIn("Secure", header)
+        self.assertIn("HttpOnly", header)
+        self.assertNotIn("Domain=", header)
+        self.assertIn("Path=/", header)
+
+    def test_google_verification_fails_closed_without_client_id(self):
+        """Regression: audience=None skipped the audience check, accepting a
+        Google ID token minted for any other application."""
+        saved = auth.GOOGLE_CLIENT_ID
+        try:
+            auth.GOOGLE_CLIENT_ID = ""
+            with patch("google.oauth2.id_token.verify_oauth2_token") as mock_verify:
+                with self.assertRaises(HTTPException) as ctx:
+                    auth.verify_google_credential("some-credential")
+                self.assertEqual(ctx.exception.status_code, 503)
+                mock_verify.assert_not_called()
+        finally:
+            auth.GOOGLE_CLIENT_ID = saved
+
+    def test_admin_credentials_requires_admin_key(self):
+        """Regression: with ADMIN_KEY unset the endpoint served every sign-in's
+        email, IP and user agent to anyone."""
+        request = MagicMock(spec=Request)
+        request.headers = {}
+        saved = os.environ.get("ADMIN_KEY")
+        try:
+            os.environ["ADMIN_KEY"] = ""
+            with self.assertRaises(HTTPException) as ctx:
+                main.get_credentials_file(request, "txt")
+            self.assertEqual(ctx.exception.status_code, 503)
+        finally:
+            if saved is None:
+                os.environ.pop("ADMIN_KEY", None)
+            else:
+                os.environ["ADMIN_KEY"] = saved
+
+    def test_admin_credentials_rejects_wrong_key(self):
+        request = MagicMock(spec=Request)
+        request.headers = {"x-admin-key": "wrong"}
+        saved = os.environ.get("ADMIN_KEY")
+        try:
+            os.environ["ADMIN_KEY"] = "correct-key"
+            with self.assertRaises(HTTPException) as ctx:
+                main.get_credentials_file(request, "txt")
+            self.assertEqual(ctx.exception.status_code, 403)
+        finally:
+            if saved is None:
+                os.environ.pop("ADMIN_KEY", None)
+            else:
+                os.environ["ADMIN_KEY"] = saved
+
+    def test_client_ip_ignores_spoofed_forwarded_for_by_default(self):
+        """Regression: throttling keyed on a header the client controls."""
+        request = MagicMock(spec=Request)
+        request.client = MagicMock()
+        request.client.host = "198.51.100.7"
+        request.headers = {"x-forwarded-for": "1.2.3.4"}
+        saved = main.TRUSTED_PROXY_HOPS
+        try:
+            main.TRUSTED_PROXY_HOPS = 0
+            self.assertEqual(main._get_client_ip(request), "198.51.100.7")
+            main.TRUSTED_PROXY_HOPS = 1
+            self.assertEqual(main._get_client_ip(request), "1.2.3.4")
+        finally:
+            main.TRUSTED_PROXY_HOPS = saved
 
     def test_throttle_reports_seconds(self):
         table = {"127.0.0.1": time.time()}

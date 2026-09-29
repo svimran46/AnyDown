@@ -6,10 +6,17 @@ set -eu
 node /opt/bgutil/server/build/main.js --host 127.0.0.1 --port 4416 &
 POT_PID=$!
 
+UVICORN_PID=""
+
 cleanup() {
+  # Forward the signal to the app so it can drain in-flight requests.
+  [ -n "$UVICORN_PID" ] && kill "$UVICORN_PID" 2>/dev/null || true
   kill "$POT_PID" 2>/dev/null || true
 }
 trap cleanup INT TERM EXIT
+
+# Do not `exec` uvicorn below: exec replaces the shell, so this EXIT trap would
+# never run and the provider process would be orphaned on shutdown.
 
 # Poll for provider readiness instead of a simple sleep.
 PROVIDER_READY=0
@@ -33,8 +40,10 @@ if [ -n "${YOUTUBE_COOKIES_FILE:-}" ] && [ -f "$YOUTUBE_COOKIES_FILE" ]; then
   export YOUTUBE_COOKIES_FILE=/tmp/youtube_cookies.txt
 fi
 
-# Trust the proxy's X-Forwarded-For so request.client.host is the real client
-# IP (required for per-IP throttling behind Render's router). Overridable via
-# FORWARDED_ALLOW_IPS if you front this with a stricter proxy setup.
-exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-10000}" \
-  --proxy-headers --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-*}"
+# --proxy-headers makes uvicorn set request.client.host from X-Forwarded-For.
+# The app deliberately does NOT read that header itself (see TRUSTED_PROXY_HOPS
+# in .env.example): it is client-controlled and would defeat rate limiting.
+uvicorn main:app --host 0.0.0.0 --port "${PORT:-10000}" \
+  --proxy-headers --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-*}" &
+UVICORN_PID=$!
+wait "$UVICORN_PID"

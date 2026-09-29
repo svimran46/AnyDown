@@ -1,0 +1,42 @@
+# Keep local secrets and build artifacts out of the image. Without this,
+# `COPY . .` bakes a developer's .env, cookies, SQLite DB and downloaded media
+# into every published layer.
+
+.git
+.gitignore
+.github
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.cookies.txt
+cookies.txt
+youtube_cookies.txt
+
+# Local data written at runtime
+data/
+downloads/
+*.db
+*.sqlite
+*.sqlite3
+credentials.txt
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Docs and editor noise
+*.md
+!RENDER-YOUTUBE.md
+.vscode/
+.idea/
+.DS_Store

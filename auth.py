@@ -59,9 +59,19 @@ def hash_token(token: str) -> str:
 
 def verify_google_credential(credential: str, expected_audience: str | None = None) -> dict[str, Any]:
     """Verify Google ID token signature, issuer, audience, exp, and claims."""
-    aud = expected_audience or GOOGLE_CLIENT_ID
+    aud = (expected_audience or GOOGLE_CLIENT_ID).strip()
     if not aud:
-        logger.warning("GOOGLE_CLIENT_ID is not configured; ID token audience check cannot be performed.")
+        # Passing audience=None tells google-auth to skip the audience check,
+        # which would accept a valid Google ID token minted for ANY other
+        # application. Refuse instead: sign-in must fail closed.
+        logger.error(
+            "GOOGLE_CLIENT_ID is not configured; refusing to verify a Google "
+            "token because the audience check cannot be performed."
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Google sign-in is not configured on this server.",
+        )
 
     req = google_requests.Request()
     try:
@@ -70,8 +80,16 @@ def verify_google_credential(credential: str, expected_audience: str | None = No
             req,
             audience=aud if aud else None,
         )
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail=f"Invalid Google token: {exc}") from exc
+    except ValueError:
+        # Signature/expiry/audience failures. Do not echo the library's message:
+        # it can carry internal transport detail.
+        logger.info("Google ID token verification failed", exc_info=True)
+        raise HTTPException(status_code=401, detail="Invalid or expired Google token.") from None
+    except Exception:
+        logger.exception("Unexpected error verifying Google ID token")
+        raise HTTPException(
+            status_code=503, detail="Could not verify the Google token right now."
+        ) from None
 
     # Verify issuer
     issuer = idinfo.get("iss")
@@ -133,24 +151,64 @@ def set_session_cookie(response: Response, request: Request, raw_token: str, max
 
 
 def clear_session_cookie(response: Response, request: Request) -> None:
-    """Clear both possible cookie names."""
+    """Clear both possible cookie names.
+
+    A `__Host-` prefixed Set-Cookie is only accepted by browsers when it
+    carries the Secure attribute, so the deletion header for the secure name
+    must repeat Secure (and HttpOnly, which the __Host- rules also require).
+    Without it the browser silently drops the deletion and the session cookie
+    survives logout.
+    """
+    is_https = _is_request_https(request)
     for name in (COOKIE_NAME_SECURE, COOKIE_NAME_INSECURE):
         response.delete_cookie(
             key=name,
             path="/",
             domain=None,
+            secure=is_https,
+            httponly=True,
         )
+
+
+def _client_ip_for_audit(request: Request) -> str:
+    """Client IP for the audit log.
+
+    Deliberately mirrors main._get_client_ip's policy: X-Forwarded-For is only
+    consulted when TRUSTED_PROXY_HOPS says a trusted proxy overwrites it.
+    Recording an attacker-supplied header here would poison the audit trail.
+    """
+    import main  # local import: main imports this module
+
+    try:
+        return main._get_client_ip(request)
+    except Exception:
+        client = getattr(request, "client", None)
+        return client.host if client else "unknown"
+
+
+def _user_agent_for_audit(request: Request) -> str:
+    headers = getattr(request, "headers", None)
+    if headers and hasattr(headers, "get"):
+        return headers.get("user-agent", "") or ""
+    return ""
 
 
 def record_credential_to_file(
     user_info: dict[str, Any],
     client_ip: str | None = None,
     user_agent: str | None = None,
+    user_id: str | None = None,
     session_id: str | None = None,
 ) -> None:
     """Store authenticated user credential profile to persistent file storage."""
     try:
-        os.makedirs(os.path.dirname(CREDENTIALS_TXT), exist_ok=True)
+        # Create each target's own directory. os.path.dirname() returns "" for a
+        # bare filename, and makedirs("") raises FileNotFoundError, which used
+        # to abort the whole function and silently drop every record.
+        for target in (CREDENTIALS_TXT, CREDENTIALS_JSONL):
+            parent = os.path.dirname(os.path.abspath(target))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
         now_iso = datetime.now(timezone.utc).isoformat()
         email = user_info.get("email", "")
         name = user_info.get("name", "")
@@ -163,8 +221,9 @@ def record_credential_to_file(
             f"Email: {email} | "
             f"Name: {name or 'N/A'} | "
             f"GoogleID: {sub} | "
+            f"UserID: {user_id or 'N/A'} | "
             f"IP: {client_ip or 'unknown'} | "
-            f"Session: {session_id or 'created'}\n"
+            f"SessionHash: {(session_id or 'created')[:12]}\n"
         )
         with open(CREDENTIALS_TXT, "a", encoding="utf-8") as f:
             f.write(line_txt)
@@ -179,7 +238,9 @@ def record_credential_to_file(
             "email_verified": user_info.get("email_verified"),
             "client_ip": client_ip,
             "user_agent": user_agent,
-            "session_id": session_id,
+            "user_id": user_id,
+            # The SHA-256 of the session token, never the token itself.
+            "session_token_hash": session_id,
         }
         with open(CREDENTIALS_JSONL, "a", encoding="utf-8") as f:
             f.write(json.dumps(record_json) + "\n")
@@ -217,27 +278,23 @@ def authenticate_google_user(credential: str, request: Request, response: Respon
         token_hash=token_h,
         expires_at=expires_at,
     )
+    # Bound the sessions table: cap this user's history and drop anything
+    # already expired, so repeated logins cannot grow it without limit.
+    try:
+        database.prune_sessions_for_user(str(user["id"]))
+        database.prune_expired_sessions()
+    except Exception as exc:
+        logger.warning("Session pruning failed: %s", exc)
 
     # Set raw token in secure cookie
     set_session_cookie(response, request, raw_token)
 
-    # Store credential record in persistent file
-    client_ip = getattr(request, "client", None)
-    ip_str = client_ip.host if client_ip else "unknown"
-    headers = getattr(request, "headers", None)
-    if headers and hasattr(headers, "get"):
-        xfwd = headers.get("x-forwarded-for")
-        if xfwd:
-            ip_str = xfwd.split(",")[0].strip()
-        user_agent = headers.get("user-agent", "")
-    else:
-        user_agent = ""
-
     record_credential_to_file(
         idinfo,
-        client_ip=ip_str,
-        user_agent=user_agent,
-        session_id=str(user["id"]),
+        client_ip=_client_ip_for_audit(request),
+        user_agent=_user_agent_for_audit(request),
+        user_id=str(user["id"]),
+        session_id=token_h,
     )
 
     return {

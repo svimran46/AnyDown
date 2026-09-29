@@ -110,6 +110,7 @@ def _socket_connect(
     address: tuple,
     timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
     source_address=None,
+    socket_options=None,
 ):
     host = str(address[0])
     try:
@@ -123,6 +124,13 @@ def _socket_connect(
             sock.settimeout(timeout)
         if source_address:
             sock.bind(source_address)
+        for opt in socket_options or ():
+            level, optname, value = opt
+            if optname is socket.TCP_NODELAY:
+                # Some platforms report TCP_NODELAY as 0; normalise.
+                sock.setsockopt(level, optname, int(bool(value)))
+            else:
+                sock.setsockopt(level, optname, value)
         sock.connect(address)
         return sock
     except OSError:
@@ -130,7 +138,8 @@ def _socket_connect(
         raise
 
 
-def _connect_protected(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+def _connect_protected(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None,
+                       socket_options=None):
     host = str(address[0])
     port = address[1] if len(address) > 1 and isinstance(address[1], int) else None
 
@@ -150,12 +159,17 @@ def _connect_protected(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_a
     # 3) Hostnames: atomic resolve-validate-connect per address. Connecting
     #    to the validated IP (not re-resolving inside the OS) closes the
     #    DNS-rebinding race.
-    resolved = _resolve_host(host)
+    try:
+        resolved = _resolve_host(host)
+    except socket.gaierror as exc:
+        raise OSError(f"Could not resolve {host!r}: {exc}") from exc
     last_err: OSError | None = None
     for ip in resolved:
         _assert_routable(ip)
         try:
-            return _socket_connect((str(ip), *address[1:]), timeout, source_address)
+            return _socket_connect(
+                (str(ip), *address[1:]), timeout, source_address, socket_options
+            )
         except OSError as exc:
             last_err = exc
     raise last_err if last_err else OSError(f"Could not resolve {host!r}")
@@ -171,9 +185,13 @@ def _install_ssrf_guard() -> None:
             socket.create_original_connection = socket.create_connection
 
         def guarded_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
-                                      source_address=None, **kwargs):
+                                      source_address=None, socket_options=None, **kwargs):
+            # urllib3 passes socket_options (it defaults to TCP_NODELAY).
+            # Swallowing it silently disabled Nagle, so thread it through.
             try:
-                return _connect_protected(address, timeout, source_address)
+                return _connect_protected(
+                    address, timeout, source_address, socket_options=socket_options
+                )
             except BlockedAddressError as err:
                 raise yt_dlp.utils.DownloadError(str(err)) from err
 
@@ -214,13 +232,22 @@ DEFAULT_YOUTUBE_CLIENTS = ("mweb", "tv", "")
 # reported there does not match the latest commit on main, the service is
 # running an older image and must be redeployed (Render: "Clear build cache
 # & deploy" — Docker layer caching can otherwise serve a stale image).
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.2.0"
 
 
-# Loopback peers are always exempt: the bgutil provider runs on 127.0.0.1 in
-# the supported Docker deployment (and the plugin may use that default even
+# Spellings of the loopback interface. The bgutil provider runs on 127.0.0.1
+# in the supported Docker deployment, and the configured URL may use any of
+# these, so they are treated as the same host (still gated on the exact port).
+_LOOPBACK_ALIASES = frozenset({"127.0.0.1", "localhost", "::1", "localhost.localdomain"})
+
+
 def _is_exempt_target(host: str, port: int | None) -> bool:
-    """True if (host, port) matches a server-configured peer (e.g. POT provider, proxy)."""
+    """True if (host, port) matches a server-configured peer (e.g. POT provider, proxy).
+
+    Only server configuration can grant an exemption; nothing a user submits
+    influences this. The exemption is also port-matched, so a configured
+    loopback peer on 4416 does not open loopback:8000 to SSRF.
+    """
     host_clean = host.lower().rstrip(".")
     for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL, YOUTUBE_PROXY_URL):
         if not url:
@@ -232,29 +259,18 @@ def _is_exempt_target(host: str, port: int | None) -> bool:
                 continue
             target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
 
-            is_same_host = (host_clean == target_host)
-            if not is_same_host and target_host in {"127.0.0.1", "localhost", "::1", "localhost.localdomain"}:
-                is_same_host = host_clean in {"127.0.0.1", "localhost", "::1", "localhost.localdomain"}
+            if target_host in _LOOPBACK_ALIASES:
+                is_same_host = host_clean in _LOOPBACK_ALIASES
+            else:
+                is_same_host = host_clean == target_host
 
-            if is_same_host and (port is None or port == target_port):
+            # An unknown port is never exempted: exempting "any port" would
+            # turn a single configured peer into an open internal port range.
+            if is_same_host and port is not None and port == target_port:
                 return True
         except Exception:
             continue
     return False
-
-
-def _config_exempt_hosts() -> set[str]:
-    """Hostnames the app is *designed* to reach, from server config only."""
-    hosts = set()
-    for url in (YTDLP_POT_PROVIDER_URL, FACEBOOK_PROXY_URL, YOUTUBE_PROXY_URL):
-        if url:
-            try:
-                host = (urlparse(url).hostname or "").lower().rstrip(".")
-                if host:
-                    hosts.add(host)
-            except Exception:
-                pass
-    return hosts
 
 
 def _host(url: str) -> str:
@@ -410,8 +426,19 @@ def _find_downloaded_file(output_dir: str, job_id: str, info: dict | None = None
     if not candidates:
         return None
 
-    # Prefer exact matches over mtime heuristic
-    return max(candidates, key=os.path.getmtime)
+    # Prefer exact matches over mtime heuristic. Skip candidates that vanish
+    # between the listing and the stat: cleanup_expired runs concurrently and
+    # a FileNotFoundError here would fail an otherwise successful download.
+    best: str | None = None
+    best_mtime = float("-inf")
+    for candidate in candidates:
+        try:
+            mtime = os.path.getmtime(candidate)
+        except OSError:
+            continue
+        if mtime > best_mtime:
+            best, best_mtime = candidate, mtime
+    return best
 
 
 def _youtube_options(ydl_opts: dict, client: str | None = None) -> None:
@@ -432,6 +459,15 @@ def _youtube_options(ydl_opts: dict, client: str | None = None) -> None:
     if client:
         diagnostic_logger.info("[YOUTUBE] Using player client: %s", client)
         extractor_args["youtube"] = {"player_client": [client]}
+
+    # Applied here, not in _apply_platform_options: YouTube URLs never reach
+    # that function, so putting it there made YOUTUBE_PROXY_URL dead config.
+    if YOUTUBE_PROXY_URL:
+        ydl_opts["proxy"] = YOUTUBE_PROXY_URL
+        diagnostic_logger.info(
+            "[YOUTUBE] Routing request through configured proxy: %s",
+            urlparse(YOUTUBE_PROXY_URL).hostname or "configured",
+        )
 
     if YTDLP_POT_PROVIDER_URL:
         extractor_args["youtubepot-bgutilhttp"] = {
@@ -492,8 +528,63 @@ def _is_youtube_retryable_error(error: Exception) -> bool:
         "forbidden",
         "temporarily blocked",
         "requested format is not available",
+        # Observed from yt-dlp on datacenter IPs: a stale/invalid player
+        # context. The next client in the chain usually recovers.
+        "the page needs to be reloaded",
     )
     return any(marker in text for marker in markers)
+
+
+def _format_count(info: dict | None) -> int:
+    """Number of playable formats an extraction actually produced."""
+    if not isinstance(info, dict):
+        return 0
+    return len(info.get("formats") or [])
+
+
+# An extraction returning no video formats at all is unusable.
+# A *tiny* ladder that tops out at <= 480p is the observed signature of the
+# `mweb` client without a GVS PO token: 5 formats, one 360p video, no error.
+# A genuinely low-resolution video also trips this, but then the next client in
+# the chain simply returns the same thing, so the only cost is one extra
+# extraction attempt; serving a crippled ladder is the worse outcome.
+_UNDER_EXTRACTED_MAX_FORMATS = 8
+_UNDER_EXTRACTED_MAX_HEIGHT = 480
+
+
+def _is_under_extracted(info: dict | None, attempted_format_id: str | None) -> bool:
+    """True when an extraction "succeeded" but returned an unusable format list.
+
+    This is the failure mode behind "the downloader still asks for cookies": a
+    pinned client (notably `mweb` without a GVS PO token) does not raise. It
+    returns HTTP 200 with a single low-resolution progressive format and no
+    error at all, so a success-based fallback chain accepts it and never tries
+    the remaining clients. The user then sees a one-rung 360p ladder and
+    concludes the problem is missing cookies.
+
+    Under-extracted means: no formats at all, no video formats, a suspiciously
+    small ladder capped at low resolution, or (for downloads) a specific format
+    that is absent from the returned list.
+    """
+    if not isinstance(info, dict):
+        return True
+    formats = info.get("formats") or []
+    if not formats:
+        return True
+
+    if attempted_format_id:
+        return not any(
+            str(f.get("format_id")) == str(attempted_format_id) for f in formats
+        )
+
+    video = [f for f in formats if f.get("vcodec") not in (None, "none")]
+    if not video:
+        return True
+    if len(formats) <= _UNDER_EXTRACTED_MAX_FORMATS:
+        max_height = max((f.get("height") or 0) for f in video)
+        if max_height <= _UNDER_EXTRACTED_MAX_HEIGHT:
+            return True
+    return False
 
 
 def _youtube_clients() -> list[str]:
@@ -560,18 +651,32 @@ def _extract_info_with_youtube_fallback(url: str, base_opts: dict, download: boo
 
         # Format IDs can differ between YouTube clients. If the primary client
         # failed and we are falling back during an actual download, use a
-        # client-neutral best format instead of carrying an incompatible ID.
+        # client-neutral selector instead of carrying an incompatible ID.
+        #
+        # The resolution ceiling is preserved across the fallback: switching
+        # clients must never hand back a higher quality than the one the
+        # server authorized for this request.
         if download and index > 0 and opts.get("format"):
             has_audio_pp = any(
                 pp.get("key") == "FFmpegExtractAudio"
                 for pp in opts.get("postprocessors", [])
                 if isinstance(pp, dict)
             )
-            opts["format"] = "bestaudio/best" if has_audio_pp else "bestvideo+bestaudio/best"
+            cap = f"[height<={opts['_max_height']}]" if opts.get("_max_height") else ""
+            if has_audio_pp:
+                opts["format"] = "bestaudio/best"
+            elif cap:
+                opts["format"] = f"bestvideo{cap}+bestaudio{cap}/best{cap}"
+            else:
+                opts["format"] = "bestvideo+bestaudio/best"
             diagnostic_logger.info(
-                "[YOUTUBE] Fallback client=%s using client-neutral format selector",
+                "[YOUTUBE] Fallback client=%s using client-neutral format selector%s",
                 _client_label(client),
+                f" capped at {opts['_max_height']}p" if cap else "",
             )
+
+        # _max_height is our own bookkeeping key, not a yt-dlp option.
+        opts.pop("_max_height", None)
 
         diagnostic_logger.info(
             "[YOUTUBE] Attempt %d/%d using client=%s",
@@ -579,24 +684,53 @@ def _extract_info_with_youtube_fallback(url: str, base_opts: dict, download: boo
             len(clients),
             _client_label(client),
         )
+        requested_format = (opts.get("format") or "").split("/")[0] or None
+
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
-            diagnostic_logger.info(
-                "[YOUTUBE] Success using client=%s", _client_label(client)
-            )
-            return info, client
         except yt_dlp.utils.DownloadError as exc:
             last_error = exc
             if index == len(clients) - 1 or not _is_youtube_retryable_error(exc):
                 raise
             diagnostic_logger.warning(
                 "[YOUTUBE] client=%s failed with a retryable YouTube error; trying next client",
-                client,
+                _client_label(client),
+            )
+            continue
+
+        # A success that produced no usable formats is a failure. Without this
+        # check the chain returns the first non-raising result, so a crippled
+        # mweb extraction is served instead of the good one from a later client.
+        if _is_under_extracted(info, requested_format):
+            n = _format_count(info)
+            if index < len(clients) - 1:
+                diagnostic_logger.warning(
+                    "[YOUTUBE] client=%s returned only %d format(s) "
+                    "(requested=%r); trying next client",
+                    _client_label(client), n, requested_format,
+                )
+                last_error = UnsupportedURLError(
+                    f"client {_client_label(client)} returned an incomplete "
+                    f"format list ({n} formats)"
+                )
+                continue
+            # Last client: accept whatever it gave us rather than failing a
+            # download that may well have succeeded.
+            diagnostic_logger.warning(
+                "[YOUTUBE] final client=%s returned only %d format(s)",
+                _client_label(client), n,
             )
 
-    assert last_error is not None
-    raise last_error
+        diagnostic_logger.info(
+            "[YOUTUBE] Success using client=%s (%d formats)",
+            _client_label(client), _format_count(info),
+        )
+        return info, client
+
+    if last_error is not None:
+        raise last_error
+    raise UnsupportedURLError("YouTube extraction failed for every configured client.")
 
 
 def _base_options() -> dict:
@@ -627,11 +761,16 @@ def _base_options() -> dict:
 
 
 def _apply_platform_options(url: str, ydl_opts: dict) -> None:
+    """Apply proxy/platform tweaks for NON-YouTube URLs.
+
+    YouTube never reaches this function: fetch_info/download_media route
+    is_youtube() URLs to _extract_info_with_youtube_fallback instead, which
+    calls _youtube_options() directly. The YouTube proxy is therefore applied
+    in _youtube_options(), not here.
+    """
     if is_youtube(url):
         diagnostic_logger.info(f"[EXTRACTION] YouTube URL detected: {url}")
         _youtube_options(ydl_opts)
-        if YOUTUBE_PROXY_URL:
-            ydl_opts["proxy"] = YOUTUBE_PROXY_URL
     elif is_facebook(url) and FACEBOOK_PROXY_URL:
         ydl_opts["proxy"] = FACEBOOK_PROXY_URL
 
@@ -715,6 +854,7 @@ def fetch_info(url: str) -> dict:
             )
         else:
             _apply_platform_options(url, ydl_opts)
+            ydl_opts.pop("_max_height", None)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             diagnostic_logger.info("[EXTRACTION] fetch_info extraction completed successfully")
@@ -781,8 +921,15 @@ def download_media(
     format_has_audio: bool = False,
     audio_only: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
+    max_height: int | None = None,
 ) -> tuple[str, str]:
-    """Download media. Returns (filepath_on_disk, display_filename)."""
+    """Download media. Returns (filepath_on_disk, display_filename).
+
+    `max_height` is the server-verified resolution ceiling for this request.
+    It is enforced inside the format selector itself, so a format that
+    resolves higher than the caller is entitled to can never be produced even
+    if yt-dlp's own selection logic prefers it.
+    """
     _install_ssrf_guard()
     os.makedirs(output_dir, exist_ok=True)
     outtmpl = os.path.join(output_dir, f"{job_id}.%(ext)s")
@@ -821,30 +968,46 @@ def download_media(
         ydl_opts["merge_output_format"] = "mp4"
         if format_id:
             # Video-only formats need best audio merged; combined formats can
-            # be downloaded directly. The frontend tells us which case applies.
+            # be downloaded directly. The server tells us which case applies.
+            #
+            # `cap` keeps the selector from ever resolving above the
+            # server-verified ceiling. Without it, `bestvideo+bestaudio/best`
+            # in the fallback arm silently hands a guest the 4K rendition of a
+            # "720p" request, which is the same gate bypass as omitting the
+            # format entirely.
+            cap = f"[height<={max_height}]" if max_height else ""
             if format_has_audio:
-                ydl_opts["format"] = f"{format_id}/bestvideo+bestaudio/best"
+                ydl_opts["format"] = f"{format_id}{cap}/bestvideo{cap}+bestaudio{cap}/best{cap}"
             else:
-                ydl_opts["format"] = f"{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best"
+                ydl_opts["format"] = (
+                    f"{format_id}{cap}+bestaudio{cap}/{format_id}{cap}"
+                    f"/bestvideo{cap}+bestaudio{cap}/best{cap}"
+                )
+        elif max_height:
+            # No explicit format but a verified ceiling: honour the ceiling.
+            cap = f"[height<={max_height}]"
+            ydl_opts["format"] = f"bestvideo{cap}+bestaudio{cap}/best{cap}"
         else:
             ydl_opts["format"] = "bestvideo+bestaudio/best"
+
+    # Carried into _extract_info_with_youtube_fallback so a client retry keeps
+    # the same resolution ceiling. Not a yt-dlp option; popped before use.
+    ydl_opts["_max_height"] = max_height
 
     diagnostic_logger.info("[EXTRACTION] Starting download_media extraction")
 
     try:
         if is_youtube(url):
-            try:
-                info, used_client = _extract_info_with_youtube_fallback(
-                    url, ydl_opts, download=True
-                )
-            except yt_dlp.utils.DownloadError:
-                raise
+            info, used_client = _extract_info_with_youtube_fallback(
+                url, ydl_opts, download=True
+            )
             diagnostic_logger.info(
                 "[EXTRACTION] download_media completed with YouTube client=%s",
                 used_client,
             )
         else:
             _apply_platform_options(url, ydl_opts)
+            ydl_opts.pop("_max_height", None)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
             diagnostic_logger.info("[EXTRACTION] download_media extraction completed successfully")

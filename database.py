@@ -208,6 +208,77 @@ def upsert_user(
         conn.close()
 
 
+MAX_SESSIONS_PER_USER = int(os.getenv("MAX_SESSIONS_PER_USER", "10"))
+
+
+def prune_sessions_for_user(user_id: str, keep: int = MAX_SESSIONS_PER_USER) -> int:
+    """Drop a user's oldest sessions beyond `keep`. Returns rows removed.
+
+    Without this, every login inserted a row forever; the sessions table only
+    ever shrank on an explicit logout.
+    """
+    if keep <= 0:
+        return 0
+    now = datetime.now(timezone.utc)
+    conn = _get_connection()
+    try:
+        if _is_postgres:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM sessions
+                    WHERE user_id = %s
+                      AND id NOT IN (
+                        SELECT id FROM sessions
+                        WHERE user_id = %s
+                        ORDER BY created_at DESC
+                        LIMIT %s
+                      );
+                    """,
+                    (user_id, user_id, keep),
+                )
+                removed = cur.rowcount
+                conn.commit()
+                return max(0, removed)
+        with conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                DELETE FROM sessions
+                WHERE user_id = ?
+                  AND id NOT IN (
+                    SELECT id FROM sessions
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                  );
+                """,
+                (user_id, user_id, keep),
+            )
+            return max(0, cur.rowcount)
+    finally:
+        conn.close()
+
+
+def prune_expired_sessions() -> int:
+    """Delete sessions whose expiry has passed. Returns rows removed."""
+    now = datetime.now(timezone.utc)
+    conn = _get_connection()
+    try:
+        if _is_postgres:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sessions WHERE expires_at <= %s", (now,))
+                removed = cur.rowcount
+                conn.commit()
+                return max(0, removed)
+        with conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM sessions WHERE expires_at <= ?", (now.isoformat(),))
+            return max(0, cur.rowcount)
+    finally:
+        conn.close()
+
+
 def create_session(user_id: str, token_hash: str, expires_at: datetime) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     conn = _get_connection()

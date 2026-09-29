@@ -68,11 +68,37 @@ class JobManagerTests(unittest.TestCase):
         self.assertIsNone(self.jm.get(job.id))
         self.assertFalse(os.path.exists(file_path))
 
-    def test_cleanup_stuck_jobs(self):
-        job = self.jm.create_job("https://example.com/stuck")
-        job.updated_at = time.time() - 10  # Exceeded TTL while still queued
+    def test_in_flight_jobs_are_not_expired(self):
+        """Regression: a long-running download was evicted once it exceeded the
+        TTL, which deleted the file underneath it and leaked it permanently."""
+        for status in (JobStatus.QUEUED, JobStatus.DOWNLOADING):
+            with self.subTest(status=status):
+                job = self.jm.create_job("https://example.com/long")
+                self.jm.update(job.id, status=status)
+                job.updated_at = time.time() - 10_000
+                self.jm.cleanup_expired(self.temp_dir)
+                self.assertIsNotNone(self.jm.get(job.id))
+
+    def test_expired_failed_job_is_dropped(self):
+        job = self.jm.create_job("https://example.com/bad")
+        self.jm.update(job.id, status=JobStatus.FAILED, error="boom")
+        job.finished_at = time.time() - 10
         self.jm.cleanup_expired(self.temp_dir)
         self.assertIsNone(self.jm.get(job.id))
+
+    def test_cleanup_prefix_sweep_removes_all_files_for_a_job(self):
+        job = self.jm.create_job("https://example.com/multi")
+        names = [f"{job.id}.mp4", f"{job.id}.part", f"{job.id}.ytdl"]
+        for n in names:
+            with open(os.path.join(self.temp_dir, n), "w") as f:
+                f.write("x")
+        self.jm.update(job.id, status=JobStatus.COMPLETED)
+        job.finished_at = time.time() - 10
+        self.jm.cleanup_expired(self.temp_dir)
+        for n in names:
+            self.assertFalse(
+                os.path.exists(os.path.join(self.temp_dir, n)), f"{n} should be gone"
+            )
 
     def test_cleanup_orphaned_temp_files(self):
         part_file = os.path.join(self.temp_dir, "orphan.part")
@@ -126,12 +152,54 @@ class SSRFAndFileGuardTests(unittest.TestCase):
         self.assertFalse(downloader._is_exempt_target("127.0.0.1", 8000))
         self.assertFalse(downloader._is_exempt_target("127.0.0.1", 22))
         self.assertFalse(downloader._is_exempt_target("127.0.0.1", 6379))
+        # Other loopback addresses are not covered by the alias list.
+        self.assertFalse(downloader._is_exempt_target("127.0.0.2", 4416))
+        # An unknown port is never exempt: "any port" would turn one
+        # configured peer into an open internal port range.
+        self.assertFalse(downloader._is_exempt_target("127.0.0.1", None))
 
     def test_is_exempt_target_denies_all_when_unconfigured(self):
         downloader.YTDLP_POT_PROVIDER_URL = ""
         downloader.FACEBOOK_PROXY_URL = ""
         self.assertFalse(downloader._is_exempt_target("127.0.0.1", 4416))
         self.assertFalse(downloader._is_exempt_target("localhost", 80))
+
+    def test_youtube_proxy_is_actually_applied(self):
+        """Regression: YOUTUBE_PROXY_URL was set only in _apply_platform_options,
+        which YouTube URLs never reach, so it was dead config."""
+        saved = downloader.YOUTUBE_PROXY_URL
+        try:
+            downloader.YOUTUBE_PROXY_URL = "http://proxy.internal:3128"
+            opts: dict = {}
+            downloader._youtube_options(opts, client="tv")
+            self.assertEqual(opts.get("proxy"), "http://proxy.internal:3128")
+        finally:
+            downloader.YOUTUBE_PROXY_URL = saved
+
+    def test_find_downloaded_file_survives_concurrent_deletion(self):
+        """Regression: max(..., key=os.path.getmtime) raised FileNotFoundError
+        when cleanup deleted the file between listdir and getmtime."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            job_id = "race-job"
+            a = os.path.join(temp_dir, f"{job_id}.mp4")
+            b = os.path.join(temp_dir, f"{job_id}.mkv")
+            for p in (a, b):
+                with open(p, "w") as f:
+                    f.write("x")
+
+            real_getmtime = os.path.getmtime
+            state = {"n": 0}
+
+            def flaky_getmtime(path):
+                state["n"] += 1
+                # Vanish on the second candidate, mid-iteration.
+                if state["n"] == 2 and os.path.exists(b):
+                    os.unlink(b)
+                return real_getmtime(path)
+
+            with patch("os.path.getmtime", side_effect=flaky_getmtime):
+                found = downloader._find_downloaded_file(temp_dir, job_id)
+            self.assertIsNotNone(found)
 
     def test_sanitize_filename_windows_reserved(self):
         for reserved in ("CON", "PRN", "AUX", "NUL", "COM1", "LPT1"):
@@ -161,6 +229,30 @@ class SSRFAndFileGuardTests(unittest.TestCase):
 
 
 class APITests(unittest.TestCase):
+    """Isolated per-test temp DB: the modules under test open a SQLite
+    connection on every request, and without this they would write
+    anydown.db into the repository."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="an-down-api-test-")
+        self._saved_db = os.environ.get("SQLITE_DB_PATH")
+        os.environ["SQLITE_DB_PATH"] = os.path.join(self._tmp, "test.db")
+        import database
+
+        database.init_db()
+
+    def tearDown(self):
+        if self._saved_db is None:
+            os.environ.pop("SQLITE_DB_PATH", None)
+        else:
+            os.environ["SQLITE_DB_PATH"] = self._saved_db
+        import shutil
+
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        # Drop jobs created by tests so they do not leak into other modules.
+        for job_id in list(getattr(main.job_manager, "_jobs", {})):
+            main.job_manager._jobs.pop(job_id, None)
+
     def test_validate_url_syntax_rejects_disallowed(self):
         from fastapi import HTTPException
         invalid_urls = [
@@ -219,13 +311,17 @@ class APITests(unittest.TestCase):
         mock_request.client.host = "203.0.113.50"
         mock_request.headers = {}
 
+        # start_download now verifies the media before queueing, so the
+        # extraction must be stubbed: this test is about the async hand-off,
+        # not about reaching YouTube.
         with patch.object(main, "_validate_public_url", return_value=None):
-            with patch.object(main, "_execute_download_job") as mock_exec:
-                res = asyncio.run(main.start_download(payload, mock_request))
-                self.assertIn("job_id", res)
-                self.assertEqual(res["status"], "queued")
-                job = main.job_manager.get(res["job_id"])
-                self.assertIsNotNone(job)
+            with patch.object(main, "_get_or_fetch_info", return_value={"formats": []}):
+                with patch.object(main, "_execute_download_job") as mock_exec:
+                    res = asyncio.run(main.start_download(payload, mock_request))
+                    self.assertIn("job_id", res)
+                    self.assertEqual(res["status"], "queued")
+                    job = main.job_manager.get(res["job_id"])
+                    self.assertIsNotNone(job)
 
     def test_get_userscript_endpoint(self):
         # Verify /anydown.user.js returns the userscript file with application/javascript

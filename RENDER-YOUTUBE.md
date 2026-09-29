@@ -25,6 +25,15 @@ The current behavior:
   Each client is only tried when the previous one fails with a known
   YouTube block (bot check, 403, 429, login required, ...).
 
+  A client is also skipped when it returns a **silently degraded** result:
+  no error, but an empty format list or a tiny ladder capped at <= 480p.
+  This matters in practice. Without a GVS PO token, `mweb` does not fail --
+  it returns HTTP 200 with a single 360p progressive format. A purely
+  success-based chain accepts that and never reaches the working clients,
+  which presents to the user as a one-rung quality ladder and is easy to
+  misread as "the server needs cookies". The chain now treats an
+  under-extracted result as a failure and continues to the next client.
+
 - `YOUTUBE_CLIENTS` optionally forces a chain (comma-separated), and
   yt-dlp's defaults are always tried last. Example: `YOUTUBE_CLIENTS=mweb,tv`.
 - `YOUTUBE_PRIMARY_CLIENT` optionally puts one client first without dropping
@@ -54,8 +63,8 @@ YouTube fixes only help once they are actually running. Every release of this
 app carries a version marker (`APP_VERSION` in `downloader.py`) that shows up
 in two places:
 
-- `GET /api/health` → `"app_version": "2.1.0"`
-- Every bot-check error message → prefixed with `[AnyDown 2.1.0]`
+- `GET /api/health` → `"app_version": "2.2.0"`
+- Every bot-check error message → prefixed with `[AnyDown 2.2.0]`
 
 If you ever see a raw yt-dlp message such as `ERROR: [youtube] ... Use
 --cookies-from-browser ...` **without** the `[AnyDown x.y.z]` prefix, the
@@ -97,3 +106,18 @@ YouTube extraction breaks regularly as YouTube and yt-dlp evolve. When it does:
 6. If every attempt still fails with the bot check on a datacenter IP, add an
    authenticated YouTube cookies file (see above) — cookies clear IP-level
    flagging that PO tokens cannot.
+
+## When a "bot check" is really a degraded extraction
+
+`Sign in to confirm you're not a bot` in the logs does not always mean YouTube
+blocked the server. Before exporting cookies, check the format count in the
+`[YOUTUBE] Success using client=...` log line:
+
+- `Success ... (5 formats)` alongside a very low `max height` means the client
+  returned a crippled result. The chain now retries these, so it should no
+  longer reach users; if it still does, pin `YOUTUBE_CLIENTS` to exclude that
+  client.
+- A genuine block produces no `Success` line for any client.
+
+Exporting cookies is still the right answer for a genuine IP-level block, but
+it is not the fix for a client that quietly returns one 360p format.
