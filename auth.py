@@ -25,7 +25,11 @@ CREDENTIALS_JSONL = os.getenv("CREDENTIALS_JSONL", os.path.join(CREDENTIALS_DIR,
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
-SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip()
+
+# There is deliberately no SESSION_SECRET. Session cookies carry an opaque
+# `secrets.token_urlsafe(32)` value; only its SHA-256 is stored, so a stolen
+# database does not yield usable cookies and the cookie needs no signing key.
+# Anything that could be forged from its contents is never read back out of it.
 
 # Cookie name: __Host- requires HTTPS, no Domain attribute, and Path=/
 COOKIE_NAME_SECURE = "__Host-anydown_session"
