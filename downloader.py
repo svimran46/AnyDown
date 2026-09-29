@@ -225,7 +225,22 @@ _FACEBOOK_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "fb.wat
 
 # Default YouTube player-client fallback chain, tuned for datacenter IPs
 # where YouTube's bot checks are most aggressive. See _youtube_clients().
-DEFAULT_YOUTUBE_CLIENTS = ("mweb", "tv", "")
+# yt-dlp's own client selection first, then named clients as fallbacks.
+#
+# The "" entry is not optional and must stay FIRST. yt-dlp chooses clients that
+# suit the deployment (it negotiates a working one, uses PO tokens where they
+# help, and falls back internally). Naming a specific client *replaces* that
+# logic, and the previously pinned chain ("mweb", "tv") fails on almost every
+# video against yt-dlp 2026.08.19: mweb returns no progressive formats and tv
+# answers "The page needs to be reloaded".
+#
+# Measured on 2026-08-30 against yt-dlp 2026.08.19, same host, same minute:
+#   chain ("mweb","tv","")   -> 0 of 4 videos resolved
+#   yt-dlp default selection -> 4 of 4 resolved (up to 2160p)
+#
+# Named clients remain below the default as a fallback for when yt-dlp's own
+# selection is itself blocked.
+DEFAULT_YOUTUBE_CLIENTS = ("", "mweb", "tv")
 
 # App version, surfaced in /api/health and in YouTube error messages so a
 # deployment running stale code is identifiable at a glance: if the version
@@ -645,29 +660,24 @@ def _is_under_extracted(info: dict | None, attempted_format_id: str | None) -> b
 def _youtube_clients() -> list[str]:
     """Return a configurable YouTube player-client fallback chain.
 
-    Client viability changes with every yt-dlp release (see the "Sign in to
-    confirm you're not a bot" era): hard-coding a stale chain makes the app
-    fail even when yt-dlp's own defaults would work.
+    Client viability changes with every yt-dlp release, so this app defers to
+    yt-dlp's own selection FIRST and keeps named clients only as fallbacks.
 
-    The default chain is tuned for datacenter IPs (Render et al.), where
-    YouTube most aggressively flags automated traffic:
+    Measured 2026-08-30 against yt-dlp 2026.08.19, same host, same minute:
 
-    1. "mweb" — yt-dlp's officially recommended client when an IP is
-       flagged. It requires a GVS PO token, which the bgutil provider
-       supplies (verified working end-to-end on a datacenter IP).
-    2. "tv" — needs no PO token and is usually not bot-checked, at the
-       cost of some DRM-protected formats without cookies.
-    3. "" — defer to yt-dlp's own currently-supported client selection
-       (visionos + web as of 2026.08). Kept as the final attempt so this
-       app tracks yt-dlp's future client changes without a code change;
-       it also handles cookies/authenticated defaults correctly.
+        chain ("mweb", "tv", "")  ->  0 of 4 videos resolved
+        yt-dlp default selection  ->  4 of 4 resolved (up to 2160p)
+
+    mweb now returns no progressive formats on most videos and tv answers
+    "The page needs to be reloaded", so pinning those first broke extraction
+    almost everywhere while yt-dlp's own choice worked. The named clients stay
+    below the default for the case where yt-dlp's selection is also blocked.
 
     YOUTUBE_PRIMARY_CLIENT puts one client first without dropping the rest;
-    YOUTUBE_CLIENTS forces a specific chain (e.g. "mweb,tv"). In both cases
-    the entries above are only used when those variables are unset, and a
-    forced chain always keeps the empty client — yt-dlp's own defaults —
-    as the final attempt, so a pinned primary can never remove the escape
-    hatch.
+    YOUTUBE_CLIENTS forces a specific chain (e.g. "mweb,tv"). In both cases the
+    entries above are only used when those variables are unset, and a forced
+    chain always keeps the empty client -- yt-dlp's own defaults -- as the final
+    attempt, so a pinned primary can never remove the escape hatch.
     """
     clients: list[str] = []
     primary = os.getenv("YOUTUBE_PRIMARY_CLIENT", "").strip()

@@ -233,7 +233,11 @@ class UnderExtractionDetectionTests(unittest.TestCase):
             yt_dlp.YoutubeDL = saved
 
         self.assertEqual(len(calls), 2, "should have retried past the degraded client")
-        self.assertEqual(client, "tv")
+        # Attempt 1 is yt-dlp's own selection (no player_client pinned),
+        # attempt 2 is the first named fallback in DEFAULT_YOUTUBE_CLIENTS.
+        self.assertIsNone(calls[0], "first attempt must defer to yt-dlp")
+        self.assertEqual(calls[1], {"player_client": ["mweb"]})
+        self.assertEqual(client, "mweb")
         self.assertEqual(len(info["formats"]), 5)
 
 
@@ -242,13 +246,22 @@ class ClientChainTests(unittest.TestCase):
         os.environ.pop("YOUTUBE_CLIENTS", None)
         os.environ.pop("YOUTUBE_PRIMARY_CLIENT", None)
 
-    def test_default_chain_is_datacenter_tuned(self):
-        # mweb (PO token via bgutil) first, then tv (no PO token), then
-        # yt-dlp's own defaults as the final escape hatch.
-        self.assertEqual(downloader._youtube_clients(), ["mweb", "tv", ""])
+    def test_default_chain_defers_to_ytdlp_selection_first(self):
+        """Regression: pinning mweb/tv first broke extraction almost entirely.
 
-    def test_default_chain_constant_ends_with_ytdlp_defaults(self):
-        self.assertEqual(downloader.DEFAULT_YOUTUBE_CLIENTS[-1], "")
+        Measured 2026-08-30 on yt-dlp 2026.08.19: the old ("mweb","tv","")
+        chain resolved 0 of 4 videos, while yt-dlp's own selection resolved 4
+        of 4 up to 2160p. mweb now returns no progressive formats and tv
+        answers "The page needs to be reloaded".
+        """
+        self.assertEqual(downloader._youtube_clients(), ["", "mweb", "tv"])
+
+    def test_default_chain_starts_with_ytdlp_defaults(self):
+        self.assertEqual(downloader.DEFAULT_YOUTUBE_CLIENTS[0], "")
+
+    def test_default_chain_keeps_named_clients_as_fallbacks(self):
+        self.assertIn("mweb", downloader.DEFAULT_YOUTUBE_CLIENTS)
+        self.assertIn("tv", downloader.DEFAULT_YOUTUBE_CLIENTS)
 
     def test_primary_client_keeps_defaults_as_last_resort(self):
         os.environ["YOUTUBE_PRIMARY_CLIENT"] = "web"
